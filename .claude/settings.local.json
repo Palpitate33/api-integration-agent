@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv venv *)",
+      "Bash(uv pip *)",
+      "Bash(uv run *)"
+    ]
+  }
+}
