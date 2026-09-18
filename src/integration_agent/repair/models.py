@@ -81,3 +81,24 @@ class RepairLoopResult(BaseModel):
     application_results: list[RepairApplicationResult] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None  # status="error" 时的异常说明（完整 traceback 保留在 warnings 中）
+
+
+class LLMFileChange(BaseModel):
+    """LLM 输出的一条文件修改（严格 JSON 契约的一部分）。
+
+    modify：content 是修改后的完整文件内容；create：content 是新文件的完整内容。
+    path 的安全校验（相对路径、禁止越界）在应用阶段逐条执行，失败只跳过不崩溃。
+    """
+
+    path: str
+    action: Literal["modify", "create"]
+    content: str
+    reason: str = ""
+
+
+class LLMRepairResponse(BaseModel):
+    """LLM 修复响应的严格结构：非法 JSON / 缺字段 / 类型错误都会被拒绝。"""
+
+    changes: list[LLMFileChange] = Field(default_factory=list)
+    summary: str = ""
+    warnings: list[str] = Field(default_factory=list)

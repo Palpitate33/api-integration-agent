@@ -14,7 +14,17 @@
 不创建/删除文件、不执行 shell / git、不发网络请求、不安装依赖、不编造代码。
 """
 
+from integration_agent.repair.llm_client import FakeLLMClient, LLMClient
+from integration_agent.repair.llm_repair_applier import (
+    LLMRepairApplier,
+    StructuredLLMRepairApplier,
+    build_repair_prompt,
+    parse_llm_response,
+    validate_path,
+)
 from integration_agent.repair.models import (
+    LLMFileChange,
+    LLMRepairResponse,
     RepairAction,
     RepairApplicationResult,
     RepairLoopResult,
@@ -41,6 +51,11 @@ __all__ = [
     "DEFAULT_MAX_ITERATIONS",
     "DeterministicRepairApplier",
     "DeterministicRepairPlanner",
+    "FakeLLMClient",
+    "LLMClient",
+    "LLMFileChange",
+    "LLMRepairApplier",
+    "LLMRepairResponse",
     "RepairAction",
     "RepairApplicationResult",
     "RepairApplier",
@@ -49,7 +64,11 @@ __all__ = [
     "RepairLoopRunner",
     "RepairPlan",
     "RepairPlanner",
+    "StructuredLLMRepairApplier",
     "apply_repair",
+    "build_repair_prompt",
+    "parse_llm_response",
     "plan_repair",
     "run_repair_loop",
+    "validate_path",
 ]
