@@ -30,10 +30,11 @@ Repair Loop
 |------|---------|------|------|
 | `integration_agent.api` | API Parser | 解析 OpenAPI 3.x（YAML/JSON）为结构化对象 | ✅ 已实现 |
 | `integration_agent.repository` | Repository Scanner | 扫描目标 Python 项目的结构、依赖，并按关键词搜索代码 | ✅ 已实现 |
-| `integration_agent.agent` | Integration Planner | 生成集成方案并编排各阶段 | 骨架 |
-| `integration_agent.tools` | Code Generator / Test Runner | 生成集成代码并在目标项目中运行测试 | 骨架 |
-| `integration_agent.validation` | Validation | 校验解析结果与生成代码的正确性 | 骨架 |
-| `integration_agent.repair` | Repair Loop | 根据测试与校验反馈自动修复集成代码 | 骨架 |
+| `integration_agent.agent` | Integration Planner | 生成集成方案（IntegrationPlan） | ✅ 已实现 |
+| `integration_agent.generation` | Code Generator | 把 IntegrationPlan 转换为 GeneratedArtifacts | ✅ 已实现 |
+| `integration_agent.validation` | Test Runner | 在隔离临时工作区运行测试，返回 TestResult | ✅ 已实现 |
+| `integration_agent.repair` | Repair Loop | RepairPlanner / RepairApplier / RepairLoop / LLMRepairApplier / DeepSeekLLMClient | ✅ 已实现 |
+| `integration_agent.tools` | 其他工具 | 预留 | 骨架 |
 
 ## 项目结构
 
@@ -55,6 +56,33 @@ Repair Loop
 ├── .env.example
 └── .gitignore
 ```
+
+## DeepSeek LLM 配置（LLM Repair Applier）
+
+DeepSeek 接入通过环境变量配置（参见 `.env.example`，切勿提交真实 Key）：
+
+```bash
+# 1. 设置 API Key（必需）
+export DEEPSEEK_API_KEY=sk-xxx
+
+# 2. 可选：模型与接口地址（默认 deepseek-flash / https://api.deepseek.com）
+export DEEPSEEK_MODEL=deepseek-flash
+export DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+# 3. 手动运行真实 API smoke test（pytest 不会自动执行，不消耗 Key）
+uv run python scripts/smoke_deepseek.py
+```
+
+用法：
+
+```python
+from integration_agent.repair import DeepSeekLLMClient, StructuredLLMRepairApplier
+
+client = DeepSeekLLMClient(json_mode=True)  # Key 从环境变量读取
+applier = StructuredLLMRepairApplier(client)  # 可注入 RepairLoopRunner
+```
+
+注意：`deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 停用，当前推荐使用 `deepseek-flash`（DeepSeek-V4.1-Flash）等模型 ID。
 
 ## 快速开始
 

@@ -14,6 +14,15 @@
 不创建/删除文件、不执行 shell / git、不发网络请求、不安装依赖、不编造代码。
 """
 
+from integration_agent.repair.deepseek_client import (
+    DEFAULT_MODEL,
+    DeepSeekAPIError,
+    DeepSeekConfigError,
+    DeepSeekLLMClient,
+    DeepSeekLLMError,
+    DeepSeekResponseError,
+    DeepSeekTimeoutError,
+)
 from integration_agent.repair.llm_client import FakeLLMClient, LLMClient
 from integration_agent.repair.llm_repair_applier import (
     LLMRepairApplier,
@@ -49,6 +58,13 @@ from integration_agent.repair.repair_planner import (
 
 __all__ = [
     "DEFAULT_MAX_ITERATIONS",
+    "DEFAULT_MODEL",
+    "DeepSeekAPIError",
+    "DeepSeekConfigError",
+    "DeepSeekLLMClient",
+    "DeepSeekLLMError",
+    "DeepSeekResponseError",
+    "DeepSeekTimeoutError",
     "DeterministicRepairApplier",
     "DeterministicRepairPlanner",
     "FakeLLMClient",
