@@ -256,11 +256,13 @@ def test_missing_dependency_becomes_add(
     petstore_plan: IntegrationPlan, petstore_artifacts: GeneratedArtifacts
 ) -> None:
     changes = {item.name: item for item in petstore_artifacts.dependency_changes}
-    assert set(changes) == {"httpx", "pydantic"}
-    assert changes["httpx"].action == "add"
-    assert changes["httpx"].version == ">=0.27"
+    # demo fixture 已声明 httpx（already_installed），不再产生重复的 DependencyChange
+    assert set(changes) == {"pydantic"}
     assert changes["pydantic"].action == "add"
+    assert changes["pydantic"].version == ">=2.0"
     assert all(item.reason for item in petstore_artifacts.dependency_changes)
+    httpx_declared = next(item for item in petstore_plan.dependencies if item.name == "httpx")
+    assert httpx_declared.already_installed is True
 
 
 def test_installed_dependency_not_duplicated(tmp_path: Path) -> None:
@@ -294,8 +296,9 @@ def test_files_to_modify_become_structured_modifications(
 
     manifest = by_path["pyproject.toml"]
     assert manifest.insertion_point == "[project] 的 dependencies 列表内"
-    assert '"httpx>=0.27",' in manifest.content
+    # httpx 已在 fixture 中声明，只剩 pydantic 需要追加
     assert '"pydantic>=2.0",' in manifest.content
+    assert '"httpx>=0.27",' not in manifest.content
 
     init = by_path["demo_project/__init__.py"]
     assert init.insertion_point == "文件末尾（导出区）"
@@ -459,7 +462,7 @@ def test_summary_describes_output(petstore_artifacts: GeneratedArtifacts) -> Non
     summary = petstore_artifacts.summary
     assert "Demo Petstore API" in summary
     assert "3 个端点" in summary
-    assert "2 项依赖" in summary
+    assert "1 项依赖" in summary
 
 
 def test_advisory_modifications_get_warning(tmp_path: Path) -> None:

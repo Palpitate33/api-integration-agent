@@ -1,7 +1,9 @@
 # 仅作为被扫描目标项目的元数据示例（不安装、不构建）。
+# 显式声明 httpx：demo 项目视作"已有 HTTP 客户端"，Planner 会复用而非重复规划；
+# 同时保证生成代码的运行时依赖在测试环境中可解析。
 [project]
 name = "demo-project"
 version = "0.1.0"
 description = "Demo target project used to test the APIForge agent."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["httpx>=0.27"]

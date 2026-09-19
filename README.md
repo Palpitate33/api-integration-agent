@@ -84,6 +84,55 @@ applier = StructuredLLMRepairApplier(client)  # 可注入 RepairLoopRunner
 
 注意：`deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 停用，当前推荐使用 `deepseek-flash`（DeepSeek-V4.1-Flash）等模型 ID。
 
+## End-to-End Pipeline
+
+把全部阶段串成一条工作流：
+
+```text
+OpenAPI
+  ↓
+Repository Understanding
+  ↓
+Integration Planning
+  ↓
+Code Generation
+  ↓
+Testing
+  ↓
+Repair Loop
+  ↓
+PipelineResult
+```
+
+```python
+from integration_agent.pipeline import run_pipeline
+
+result = run_pipeline(
+    "examples/openapi/petstore.yaml",
+    "examples/demo_project",
+    max_iterations=3,
+)
+print(result.status)  # passed / tests_failed / error
+```
+
+- **默认离线确定性执行**：不联网、不写真实仓库、不需要 API Key；
+  当前确定性 RepairApplier 不合成代码，因此测试失败时会以 `tests_failed`
+  （RepairLoop → no_progress）终止，这是预期行为。
+- **启用 LLM Repair**（需要配置 DeepSeek，见上一节）：通过依赖注入装配：
+
+```python
+from integration_agent.pipeline import run_pipeline
+from integration_agent.repair import DeepSeekLLMClient, StructuredLLMRepairApplier
+
+result = run_pipeline(
+    "examples/openapi/petstore.yaml",
+    "examples/demo_project",
+    repair_applier=StructuredLLMRepairApplier(DeepSeekLLMClient(json_mode=True)),
+)
+```
+
+- 手动演示：`uv run python scripts/e2e_demo.py`（`--llm` 启用 DeepSeek 修复）。
+
 ## 快速开始
 
 ```bash

@@ -6,7 +6,16 @@ import pytest
 
 import integration_agent
 
-STAGE_SUBMODULES = ["agent", "api", "generation", "repository", "tools", "validation", "repair"]
+STAGE_SUBMODULES = [
+    "agent",
+    "api",
+    "generation",
+    "pipeline",
+    "repository",
+    "tools",
+    "validation",
+    "repair",
+]
 
 
 def test_package_imports() -> None:

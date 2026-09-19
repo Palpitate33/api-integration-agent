@@ -184,8 +184,9 @@ def test_plan_generated_from_real_fixtures() -> None:
     assert plan.target_api.total_endpoints == 3
 
     assert plan.repository.name == "demo-project"
-    assert plan.repository.http_client is None
-    assert plan.integration_strategy.approach == "new_client_module"
+    # demo fixture 显式声明了 httpx：Planner 应识别为已有客户端并复用
+    assert plan.repository.http_client == "httpx"
+    assert plan.integration_strategy.approach == "extend_existing_client"
     assert plan.integration_strategy.client_module == "demo_project/demo_petstore_client.py"
     assert plan.integration_strategy.http_client == "httpx"
 
