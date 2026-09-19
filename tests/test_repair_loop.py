@@ -486,3 +486,23 @@ def test_real_closed_loop_terminates_as_no_progress() -> None:
     assert result.test_result is not None and result.test_result.status == "failed"
     assert result.artifacts == artifacts
     assert any("requires code synthesis" in item for item in result.warnings)
+
+
+def test_loop_passes_test_result_to_capable_applier() -> None:
+    """声明 accepts_test_result 的 Applier 会收到当前 TestResult（向后兼容扩展）。"""
+    captured = {}
+
+    class CapableApplier:
+        accepts_test_result = True
+
+        def apply(self, artifacts, plan, test_result=None):
+            captured["test_result"] = test_result
+            return repair.RepairApplicationResult(artifacts=artifacts, changed=False)
+
+    runner = FakeRunner([_failed()])
+    result = _loop(runner, applier=CapableApplier()).run(_artifacts())
+
+    assert result.status == "no_progress"
+    assert captured["test_result"] is not None
+    assert captured["test_result"].status == "failed"
+    assert captured["test_result"].failed == 1

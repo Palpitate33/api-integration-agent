@@ -168,9 +168,9 @@ class RepairLoopRunner:
                     warnings=warnings,
                 )
 
-            # 3. 应用修复
+            # 3. 应用修复（声明 accepts_test_result 的 Applier 会额外收到 TestResult）
             try:
-                application = self.repair_applier.apply(current, plan)
+                application = _apply(self.repair_applier, current, plan, test_result)
             except Exception as exc:  # noqa: BLE001
                 return self._error_result(
                     current,
@@ -232,3 +232,11 @@ class RepairLoopRunner:
             warnings=warnings,
             error=error,
         )
+
+
+def _apply(applier, artifacts, plan, test_result):
+    """调用 Applier：声明 accepts_test_result 的 Applier（如 LLMRepairApplier）
+    会额外收到当前 TestResult；其余保持 2 参调用（向后兼容）。"""
+    if getattr(applier, "accepts_test_result", False):
+        return applier.apply(artifacts, plan, test_result)
+    return applier.apply(artifacts, plan)

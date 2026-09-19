@@ -68,6 +68,10 @@ class StructuredLLMRepairApplier:
     本实现可直接注入现有循环而不破坏 RepairApplier 调用约定。
     """
 
+    # 声明本 Applier 可接收 TestResult：RepairLoop 检测到该标记时会以
+    # apply(artifacts, plan, test_result) 三参调用（向后兼容的最小扩展）。
+    accepts_test_result = True
+
     def __init__(
         self,
         llm_client: LLMClient,
