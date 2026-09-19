@@ -9,6 +9,7 @@ import integration_agent
 STAGE_SUBMODULES = [
     "agent",
     "api",
+    "api_server",
     "generation",
     "patch",
     "pipeline",

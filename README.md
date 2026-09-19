@@ -163,6 +163,34 @@ print(patch.unified_diff)
 - **Patch generation does not modify the user's repository**——纯函数，无文件系统副作用；
   `PipelineResult.patch` 已集成该结果。
 
+## Backend API（HTTP Adapter）
+
+为 Pipeline 提供最小 HTTP 接口（只做校验 + 调用 + 序列化，不复制 Pipeline 逻辑）：
+
+```bash
+# 启动后端（http://127.0.0.1:8000，Swagger：/docs）
+uv run uvicorn integration_agent.api_server.app:app --reload
+
+# 健康检查
+curl http://127.0.0.1:8000/health
+
+# 运行一次真实集成（路径限制在 examples/ 内）
+curl -X POST http://127.0.0.1:8000/api/integrations/run \
+  -H "Content-Type: application/json" \
+  -d '{"api_spec": "openapi/petstore.yaml", "project_path": "demo_project"}'
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /health` | 健康检查 `{"status": "ok"}` |
+| `POST /api/integrations/run` | 校验输入 → 调用 run_pipeline → 返回完整 PipelineResult |
+| `GET /docs` | Swagger UI（自动生成） |
+
+安全：路径只允许 examples/ 内相对路径（拒绝绝对路径 / `..` / 符号链接逃逸）；
+错误响应统一 `{"error": {"code", "message"}}`，不返回 traceback；API Key 只读
+服务端环境变量，不进入请求/响应；CORS 仅允许本地前端（localhost:5173）。
+`use_llm=true` 时启用 DeepSeek LLM Repair（需服务端配置 DEEPSEEK_API_KEY）。
+
 ## 快速开始
 
 ```bash
