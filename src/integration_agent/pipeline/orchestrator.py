@@ -13,7 +13,9 @@
         ↓
     RepairLoop.run（内部：TestRunner ↔ RepairPlanner ↔ RepairApplier 循环）
         ↓
-    PipelineResult
+    PatchGenerator.generate（纯函数，可选 original_files）
+        ↓
+    PipelineResult（含 patch: PatchResult）
 
 职责边界：
     - Pipeline 只做编排与装配，不复制任何已有模块的逻辑。
@@ -32,12 +34,14 @@
 """
 
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from integration_agent.agent import DeterministicPlanner, IntegrationPlanner, PlannerState
 from integration_agent.api import APIInfo, parse_openapi
 from integration_agent.generation import CodeGenerator, DeterministicCodeGenerator
+from integration_agent.patch import DeterministicPatchGenerator, PatchGenerator
 from integration_agent.pipeline.models import PipelineResult
 from integration_agent.repair import (
     DeterministicRepairApplier,
@@ -77,19 +81,27 @@ def run_pipeline(
     test_runner: TestRunner | None = None,
     repair_planner: RepairPlanner | None = None,
     repair_applier: RepairApplier | None = None,
+    patch_generator: PatchGenerator | None = None,
+    original_files: Mapping[str, str] | None = None,
 ) -> PipelineResult:
-    """便捷入口：默认使用全套确定性组件，可覆盖任意单个组件。"""
+    """便捷入口：默认使用全套确定性组件，可覆盖任意单个组件。
+
+    original_files：modify 文件的原始内容（path → content），由上层显式提供；
+    不提供时 modify 片段仍会保留结构化信息，只是 diff_available=False。
+    """
     return IntegrationPipeline(
         planner=planner,
         code_generator=code_generator,
         test_runner=test_runner,
         repair_planner=repair_planner,
         repair_applier=repair_applier,
+        patch_generator=patch_generator,
     ).run(
         spec_source,
         repo_root,
         request=request,
         max_iterations=max_iterations,
+        original_files=original_files,
     )
 
 
@@ -104,6 +116,7 @@ class IntegrationPipeline:
         test_runner: TestRunner | None = None,
         repair_planner: RepairPlanner | None = None,
         repair_applier: RepairApplier | None = None,
+        patch_generator: PatchGenerator | None = None,
     ) -> None:
         self.planner = planner or DeterministicPlanner()
         self.code_generator = code_generator or DeterministicCodeGenerator()
@@ -112,6 +125,7 @@ class IntegrationPipeline:
         # 因此在 run() 中解析。
         self.repair_planner = repair_planner
         self.repair_applier = repair_applier or DeterministicRepairApplier()
+        self.patch_generator = patch_generator or DeterministicPatchGenerator()
 
     def run(
         self,
@@ -120,6 +134,7 @@ class IntegrationPipeline:
         *,
         request: str = "",
         max_iterations: int = 3,
+        original_files: Mapping[str, str] | None = None,
     ) -> PipelineResult:
         warnings: list[str] = []
 
@@ -160,6 +175,15 @@ class IntegrationPipeline:
         )
         warnings.extend(loop_result.warnings)
 
+        # 6. Final Patch / Diff（纯函数组件；失败不改变 status，只记录 warning）
+        try:
+            patch_result = self.patch_generator.generate(
+                loop_result.artifacts, original_files=original_files
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Patch 生成失败：{type(exc).__name__}: {exc}")
+            patch_result = None
+
         status = "passed" if loop_result.status == "passed" else "tests_failed"
         return PipelineResult(
             status=status,
@@ -169,6 +193,7 @@ class IntegrationPipeline:
             artifacts=loop_result.artifacts,
             initial_test_result=None,  # 当前 RepairLoop 不保存初始测试结果，不重复跑测试
             repair_loop_result=loop_result,
+            patch=patch_result,
             warnings=warnings,
         )
 

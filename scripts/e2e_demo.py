@@ -109,6 +109,19 @@ def main() -> int:
             print(f"files ({len(result.artifacts.files)}):")
             for item in result.artifacts.files:
                 print(f"  - [{item.action}] {item.path}")
+    if result.patch is not None:
+        summary = result.patch.summary
+        print(
+            f"patch summary     : {summary.total_files} files "
+            f"({summary.created} created, {summary.modified} modified, "
+            f"{summary.dependencies} deps)"
+        )
+        print("patch preview     :")
+        for line in result.patch.unified_diff.splitlines()[:12]:
+            print(f"  {line}")
+        if result.patch.warnings:
+            for warning in result.patch.warnings[:3]:
+                print(f"patch warning     : {warning}")
     for warning in result.warnings[:10]:
         print(f"warning           : {warning}")
     if result.error:

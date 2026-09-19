@@ -10,6 +10,7 @@ STAGE_SUBMODULES = [
     "agent",
     "api",
     "generation",
+    "patch",
     "pipeline",
     "repository",
     "tools",

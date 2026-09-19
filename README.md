@@ -133,6 +133,36 @@ result = run_pipeline(
 
 - 手动演示：`uv run python scripts/e2e_demo.py`（`--llm` 启用 DeepSeek 修复）。
 
+## Final Patch / Diff
+
+把最终生成产物转换为结构化、可审计的修改结果：
+
+```text
+GeneratedArtifacts
+    ↓
+Test / Repair
+    ↓
+Patch / Diff
+    ↓
+Final Integration Result
+```
+
+```python
+from integration_agent.patch import DeterministicPatchGenerator
+
+patch = DeterministicPatchGenerator().generate(
+    result.artifacts,
+    original_files={"demo_project/__init__.py": "# 原始内容"},  # 可选，由上层显式提供
+)
+print(patch.unified_diff)
+```
+
+- create 文件生成真实 unified diff（`--- /dev/null` / `+++ b/path`）；
+  modify 片段（带 insertion_point）如实标记 `diff_available=False` 并保留结构化信息，
+  不伪造 diff；提供原始内容的 modify 全文生成真实 diff。
+- **Patch generation does not modify the user's repository**——纯函数，无文件系统副作用；
+  `PipelineResult.patch` 已集成该结果。
+
 ## 快速开始
 
 ```bash

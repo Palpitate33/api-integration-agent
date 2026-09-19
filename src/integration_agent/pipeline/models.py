@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from integration_agent.agent import IntegrationPlan
 from integration_agent.api import APIInfo
 from integration_agent.generation import GeneratedArtifacts
+from integration_agent.patch import PatchResult
 from integration_agent.repair import RepairLoopResult
 from integration_agent.repository import ProjectStructure
 from integration_agent.validation import TestResult
@@ -35,6 +36,7 @@ class PipelineResult(BaseModel):
     # 当前 RepairLoop 不保存初始测试结果，Pipeline 不为获取它而重复跑测试，
     # 因此该字段保持 None（除非将来 Loop 显式提供）。
     repair_loop_result: RepairLoopResult | None = None
+    patch: PatchResult | None = None  # 最终修改结果；前置阶段失败时为 None
     failed_stage: str | None = None  # status="error" 时定位：parse/scan/plan/generate
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None  # status="error" 时的异常说明（完整 traceback 在 warnings 中）
