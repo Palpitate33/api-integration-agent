@@ -33,7 +33,7 @@
     前置阶段（parse/scan/plan/generate）异常           → Pipeline "error"（failed_stage 定位）
 """
 
-import traceback
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -52,6 +52,11 @@ from integration_agent.repair import (
 )
 from integration_agent.repository import ProjectStructure, scan_repository
 from integration_agent.validation import DeterministicTestRunner, TestRunner
+
+# 阶段异常的服务端日志出口：完整 traceback 只写这里，不进 API 响应。
+# 未配置 logging 时，Python 的 lastResort handler 会把 ERROR 及以上打到 stderr，
+# 因此服务端控制台始终能看到失败详情，无需额外配置。
+_logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -207,9 +212,18 @@ class IntegrationPipeline:
         warnings: list[str],
         exc: Exception,
     ) -> PipelineResult:
-        """前置阶段异常 → status="error"，保留已产生的上游结果与完整 traceback。"""
-        error = f"{stage}: {type(exc).__name__}: {exc}"
-        warnings.append(f"{stage} 阶段失败，完整 traceback：\n{traceback.format_exc()}")
+        """前置阶段异常 → status="error"，保留已产生的上游结果。
+
+        诊断信息的分流（安全边界）：
+            - **完整 traceback 只进服务端日志**。PipelineResult 是 FastAPI 的
+              response_model，它会原样序列化给浏览器——traceback 里带着绝对路径、
+              模块名、源码行，异常消息也可能夹带本地路径，绝不能出现在响应里。
+            - 客户端只拿到 stage 级的安全说明；失败原因由 failed_stage + error
+              表达，details 去服务端日志取。
+        """
+        _logger.error("Pipeline 阶段失败：stage=%s", stage, exc_info=exc)
+        error = f"Integration failed during {stage}."
+        warnings.append(f"{stage} 阶段失败（详情见服务端日志）")
         return PipelineResult(
             status="error",
             api=api,

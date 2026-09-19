@@ -41,6 +41,20 @@ def _passed() -> validation.TestResult:
     return validation.TestResult(status="passed", exit_code=0, passed=1, duration=0.1)
 
 
+def _assert_no_internal_details(result: pipeline.PipelineResult) -> None:
+    """stage 异常返回给客户端的内容里不得有 traceback / 绝对路径 / 异常细节。
+
+    PipelineResult 是 FastAPI 的 response_model，会原样序列化给浏览器，
+    因此这些断言等价于"客户端看不到内部实现信息"。
+    """
+    client_visible = [result.error or "", *result.warnings]
+    joined = "\n".join(client_visible)
+    assert "Traceback" not in joined
+    assert 'File "' not in joined
+    assert str(EXAMPLES) not in joined  # 本地绝对路径
+    assert "site-packages" not in joined
+
+
 class FakeRunner:
     """按队列返回 TestResult 的假 Runner。"""
 
@@ -185,8 +199,9 @@ def test_parse_error(tmp_path: Path) -> None:
     assert result.failed_stage == "parse"
     assert result.api is None
     assert result.project is None
-    assert result.error is not None and "OpenAPISpecError" in result.error
-    assert any("Traceback" in item for item in result.warnings)
+    assert result.error == "Integration failed during parse."
+    assert any("parse 阶段失败" in item for item in result.warnings)
+    _assert_no_internal_details(result)
 
 
 def test_scan_error(tmp_path: Path) -> None:
@@ -196,7 +211,8 @@ def test_scan_error(tmp_path: Path) -> None:
     assert result.failed_stage == "scan"
     assert result.api is not None  # 上游结果保留
     assert result.project is None
-    assert "RepositoryError" in result.error
+    assert result.error == "Integration failed during scan."
+    _assert_no_internal_details(result)
 
 
 def test_plan_error(tmp_path: Path) -> None:
@@ -217,7 +233,8 @@ def test_plan_error(tmp_path: Path) -> None:
     assert result.status == "error"
     assert result.failed_stage == "plan"
     assert result.api is not None and result.project is not None
-    assert "PlanningError" in result.error
+    assert result.error == "Integration failed during plan."
+    _assert_no_internal_details(result)
 
 
 def test_generate_error() -> None:
@@ -229,7 +246,9 @@ def test_generate_error() -> None:
     assert result.failed_stage == "generate"
     assert result.plan is not None  # 上游结果保留
     assert result.artifacts is None
-    assert "gen boom" in result.error
+    # 异常原文（"gen boom"）不得出现在客户端可见字段中
+    assert result.error == "Integration failed during generate."
+    _assert_no_internal_details(result)
 
 
 # --------------------------------------- 场景 9-10：Protocol / round-trip

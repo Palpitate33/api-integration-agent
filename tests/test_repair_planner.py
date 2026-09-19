@@ -226,6 +226,71 @@ def test_unknown_failure_no_guessing() -> None:
     assert any("无法可靠分类" in item for item in plan.warnings)
 
 
+def test_unknown_detail_mixed_with_actionable_one_does_not_crash() -> None:
+    """回归：可归类的失败详情 + 无法归类的失败详情同时出现时曾抛 KeyError('unknown')。
+
+    计划级类别取优先级最高的（这里是 assertion），于是会进入动作生成；而动作生成
+    对**每条**详情各查一次 _reason_for / _CONFIDENCE——两个映射表当时都没有
+    "unknown" 键，直接崩溃。全 unknown 的用例不会触发它（计划级 unknown 会提前返回），
+    所以这个混合场景必须单独锁死。
+    """
+    details = [
+        _detail("assert 1 == 2", file="tests/test_a.py", line=2),
+        _detail("something completely unexpected happened", file="tests/test_b.py", line=9),
+    ]
+    plan = _plan(_result(failed=2, details=details))
+
+    assert plan.failure_category == "assertion"  # 计划级仍取最高优先级
+    assert plan.should_repair is True
+    assert len(plan.actions) == 2
+
+    unknown_action = next(action for action in plan.actions if action.file == "tests/test_b.py")
+    assert 0.0 <= unknown_action.confidence <= 1.0
+    # unknown 的置信度必须低于所有已命名类别，避免"猜不出来"显得和"有证据"一样可信
+    assert unknown_action.confidence < min(
+        repair.repair_planner._CONFIDENCE[key]
+        for key in ("assertion", "import", "dependency", "collection", "timeout")
+    )
+    assert unknown_action.reason.strip()
+    assert unknown_action.changes.strip()
+    assert unknown_action.target is None  # 不虚构修改位置
+    # 证据只能来自该详情本身，不得虚构
+    assert unknown_action.evidence == [
+        "failure message: something completely unexpected happened",
+        "test file: tests/test_b.py",
+        "line: 9",
+    ]
+    assert plan.model_validate(plan.model_dump()) is not None
+
+
+def test_unknown_detail_without_file_keeps_empty_file_and_warns() -> None:
+    """无法定位文件时沿用现有 file="" + warning 机制，不编造路径。"""
+    details = [
+        _detail("assert 1 == 2", file="tests/test_a.py"),
+        validation.FailureDetail(
+            test_name="test_y", file=None, line=None, message="totally unclear failure"
+        ),
+    ]
+    plan = _plan(_result(failed=2, details=details))
+
+    unknown_action = next(action for action in plan.actions if not action.file)
+    assert unknown_action.file == ""
+    assert unknown_action.target is None
+    assert any("Exact source file cannot be determined" in item for item in plan.warnings)
+
+
+def test_action_maps_cover_every_detail_category() -> None:
+    """契约守卫：_detail_category() 能返回的每个类别都要有 reason 与 confidence。
+
+    漏一个就是运行期 KeyError（见上面的混合用例）。这条用例把契约钉在测试里，
+    以后新增类别时会在这里失败，而不是在用户的 Pipeline 里失败。
+    """
+    from integration_agent.repair.repair_planner import DETAIL_CATEGORIES
+
+    assert DETAIL_CATEGORIES <= set(repair.repair_planner._CONFIDENCE)
+    assert DETAIL_CATEGORIES <= set(repair.repair_planner._REASONS)
+
+
 # ------------------------------------------- 场景 9：multiple failure_details
 
 

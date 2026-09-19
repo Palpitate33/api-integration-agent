@@ -18,7 +18,7 @@
     2. RepairPlan.should_repair == False（status="not_repairable"）
     3. RepairApplicationResult.changed == False（status="no_progress"，防止重复同一计划）
     4. 已达到 max_iterations 次修复（status="max_iterations"）
-    5. 任一组件抛出未预期异常（status="error"，traceback 保留在 warnings 中）
+    5. 任一组件抛出未预期异常（status="error"，完整 traceback 只写服务端日志）
 
 安全边界：
     - 不修改真实 repository、不执行 shell / git / pytest（pytest 由注入的
@@ -26,9 +26,11 @@
     - 初始 artifacts 永不被修改：循环从深拷贝开始，Applier 同样只产出新对象。
     - 只依赖 Protocol（TestRunner / RepairPlanner / RepairApplier），
       不关心实现是 deterministic 还是未来的 LLM。
+    - RepairLoopResult 会经 PipelineResult 序列化给客户端，因此其中不得出现
+      traceback / 绝对路径：诊断信息只进服务端日志。
 """
 
-import traceback
+import logging
 from typing import Protocol, runtime_checkable
 
 from integration_agent.generation import GeneratedArtifacts
@@ -47,6 +49,9 @@ from integration_agent.repair.repair_planner import (
     RepairPlanner,
 )
 from integration_agent.validation import DeterministicTestRunner, TestResult, TestRunner
+
+# 组件异常的服务端日志出口：完整 traceback 只写这里，不进 API 响应。
+_logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -220,8 +225,11 @@ class RepairLoopRunner:
         component: str,
         exc: Exception,
     ) -> RepairLoopResult:
-        error = f"{component}: {type(exc).__name__}: {exc}"
-        warnings.append(f"未预期异常（{component}），完整 traceback：\n{traceback.format_exc()}")
+        # 组件异常同样走"日志留全量、响应只留安全说明"：RepairLoopResult 会被
+        # PipelineResult 带到浏览器，异常消息本身也可能夹带本地绝对路径。
+        _logger.error("RepairLoop 组件异常：component=%s", component, exc_info=exc)
+        error = f"Repair loop failed during {component}."
+        warnings.append(f"未预期异常（{component}），详情见服务端日志")
         return RepairLoopResult(
             status="error",
             artifacts=current,

@@ -29,6 +29,14 @@ MAX_ACTIONS_PER_PLAN = 5  # 修复动作数量上限，保证计划有限可审
 # 类别优先级：数字越大越优先（用于多失败详情时确定整体类别）
 _PRIORITY = {"dependency": 40, "import": 30, "collection": 20, "assertion": 10, "unknown": 0}
 
+# _detail_category() 可能返回的全部类别。
+#
+# 这不只是文档：_CONFIDENCE / _REASONS 必须覆盖这里的每一个。计划级类别为 unknown 时
+# _build 会提前返回，但**单条** detail 的类别为 unknown 时仍会走到动作生成，于是
+# 两个映射表各查一次——漏掉任何一个键都是运行期 KeyError（曾有真实缺陷：
+# `assert 1 == 2` 与一条无法归类的失败详情同时出现时抛 KeyError('unknown')）。
+DETAIL_CATEGORIES = frozenset({"assertion", "import", "dependency", "collection", "unknown"})
+
 # 类别 → 默认置信度：只反映"证据能指向该类别"的把握，不代表修复必成功
 _CONFIDENCE = {
     "assertion": 0.6,
@@ -36,6 +44,18 @@ _CONFIDENCE = {
     "dependency": 0.7,
     "collection": 0.4,
     "timeout": 0.3,
+    # 无法归类：证据不支持任何具体判断，置信度必须低于所有已命名类别
+    "unknown": 0.2,
+}
+
+# 类别 → 修复理由。unknown 只做保守表述，不虚构原因或动作。
+_REASONS = {
+    "assertion": "测试失败证据显示断言期望与实际行为不一致",
+    "import": "测试失败证据显示 import 错误",
+    "dependency": "测试依赖的包缺失或 import 与依赖清单不一致",
+    "collection": "测试收集阶段失败",
+    "timeout": "测试执行超过时间限制",
+    "unknown": "失败详情无法归类到已知类别，仅基于现有证据进行有限修正",
 }
 
 # 收集期失败的信号（出现在消息 / traceback / stdout / stderr 中）
@@ -259,13 +279,7 @@ def _evidence_for(detail: FailureDetail) -> list[str]:
 
 
 def _reason_for(category: str) -> str:
-    return {
-        "assertion": "测试失败证据显示断言期望与实际行为不一致",
-        "import": "测试失败证据显示 import 错误",
-        "dependency": "测试依赖的包缺失或 import 与依赖清单不一致",
-        "collection": "测试收集阶段失败",
-        "timeout": "测试执行超过时间限制",
-    }[category]
+    return _REASONS[category]
 
 
 def _target_for(category: str, detail: FailureDetail) -> str | None:

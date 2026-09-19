@@ -286,14 +286,22 @@ def test_multiple_rounds() -> None:
 # --------------------------------------------- 场景 7-9：组件异常处理
 
 
+def _assert_no_internal_details(result: repair.RepairLoopResult) -> None:
+    """RepairLoopResult 会经 PipelineResult 到浏览器，不得携带诊断细节。"""
+    joined = "\n".join([result.error or "", *result.warnings])
+    assert "Traceback" not in joined
+    assert 'File "' not in joined
+    assert "site-packages" not in joined
+
+
 def test_runner_exception_becomes_error() -> None:
     result = _loop(RaisingRunner()).run(_artifacts())
 
     assert result.status == "error"
-    assert result.error is not None and "TestRunner" in result.error
-    assert "runner boom" in result.error
+    assert result.error == "Repair loop failed during TestRunner."
     assert result.iterations == 0
-    assert any("Traceback" in item for item in result.warnings)
+    assert any("TestRunner" in item for item in result.warnings)
+    _assert_no_internal_details(result)
     assert result.artifacts == _artifacts()
 
 
@@ -301,18 +309,18 @@ def test_planner_exception_becomes_error() -> None:
     result = _loop(FakeRunner([_failed()]), planner=RaisingPlanner()).run(_artifacts())
 
     assert result.status == "error"
-    assert result.error is not None and "RepairPlanner" in result.error
+    assert result.error == "Repair loop failed during RepairPlanner."
     assert result.test_result is not None and result.test_result.status == "failed"
-    assert any("Traceback" in item for item in result.warnings)
+    _assert_no_internal_details(result)
 
 
 def test_applier_exception_becomes_error() -> None:
     result = _loop(FakeRunner([_failed()]), applier=RaisingApplier()).run(_artifacts())
 
     assert result.status == "error"
-    assert result.error is not None and "RepairApplier" in result.error
+    assert result.error == "Repair loop failed during RepairApplier."
     assert len(result.repair_plans) == 1
-    assert any("Traceback" in item for item in result.warnings)
+    _assert_no_internal_details(result)
 
 
 # ------------------------------------------------- 场景 10：iteration 正确
