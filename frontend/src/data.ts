@@ -28,4 +28,5 @@ export const DEFAULT_INPUT = {
   projectPath: "demo_project",
   request: "Integrate the API into the existing project",
   maxIterations: 3,
+  demoMode: false,
 };

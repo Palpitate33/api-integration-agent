@@ -15,6 +15,7 @@ class IntegrationRunRequest(BaseModel):
     request: str = Field(default="", max_length=2000)  # 用户需求描述，透传 Pipeline
     max_iterations: int = Field(default=3, ge=1, le=10)
     use_llm: bool = False  # 是否启用 DeepSeek LLM Repair（Key 走服务端环境变量）
+    demo_mode: bool = False  # Demo-only：注入确定性测试失败（仅限固定 demo 组合）
 
 
 class ErrorDetail(BaseModel):

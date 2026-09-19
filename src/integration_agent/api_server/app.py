@@ -11,6 +11,8 @@
     - 错误响应结构化（code + message），绝不返回 Python traceback。
     - API Key 只从服务端环境变量 DEEPSEEK_API_KEY 读取，不进入请求/响应模型。
     - CORS 只允许本地开发前端 origin（不允许 "*"）。
+    - demo_mode（默认 false）只对固定 Demo 组合生效，注入内容在 demo.py 中硬编码，
+      用户无法指定目标文件或替换内容；只改内存产物，不触碰真实仓库。
 
 启动：
     uv run uvicorn integration_agent.api_server.app:app --reload
@@ -22,6 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from integration_agent.api_server.demo import DEMO_ONLY_MESSAGE, SabotagedGenerator, is_demo_target
 from integration_agent.api_server.models import IntegrationRunRequest
 from integration_agent.api_server.paths import resolve_allowed
 from integration_agent.pipeline import PipelineResult, run_pipeline
@@ -112,6 +115,13 @@ def run_integration(payload: IntegrationRunRequest) -> PipelineResult:
         raise ApiError(404, "PROJECT_NOT_FOUND", f"项目目录不存在：{payload.project_path}")
 
     kwargs: dict = {}
+    if payload.demo_mode:
+        # Demo-only：只允许固定组合，注入确定性失败；普通请求完全不经过这里。
+        # 注入目标是硬编码的，不接受任何用户输入（文件路径 / 替换内容都由服务端写死）。
+        if not is_demo_target(spec_path, project_path):
+            raise ApiError(400, "DEMO_MODE_NOT_ALLOWED", DEMO_ONLY_MESSAGE)
+        kwargs["code_generator"] = SabotagedGenerator()
+
     if payload.use_llm:
         try:
             kwargs["repair_applier"] = StructuredLLMRepairApplier(DeepSeekLLMClient(json_mode=True))

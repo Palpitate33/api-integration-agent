@@ -36,7 +36,11 @@ function testDetail(test: TestResult): string {
 }
 
 /** 根据真实 PipelineResult 一次性推导 8 个阶段的状态（不做假实时）。 */
-function deriveSteps(result: PipelineResult, useLlm: boolean): StepState[] {
+function deriveSteps(
+  result: PipelineResult,
+  useLlm: boolean,
+  demoMode: boolean
+): StepState[] {
   const steps = initialSteps();
   const loop = result.repair_loop_result;
   const failedIndex =
@@ -65,7 +69,8 @@ function deriveSteps(result: PipelineResult, useLlm: boolean): StepState[] {
     steps[4].detail = final ? `初始测试：${testDetail(final)}` : "初始测试";
   } else {
     steps[4].status = "failed";
-    steps[4].detail = `初始测试失败（${loop.repair_plans[0].failure_category}）→ 进入修复`;
+    const origin = demoMode ? "Demo Mode 注入的确定性失败" : "初始测试失败";
+    steps[4].detail = `${origin}（${loop.repair_plans[0].failure_category}）→ 进入修复`;
   }
 
   // 6. DeepSeek / Repair
@@ -111,12 +116,13 @@ export default function App() {
   const [apiSpec, setApiSpec] = useState(DEFAULT_INPUT.apiSpec);
   const [projectPath, setProjectPath] = useState(DEFAULT_INPUT.projectPath);
   const [useLlm, setUseLlm] = useState(false);
+  const [demoMode, setDemoMode] = useState(DEFAULT_INPUT.demoMode);
   const [phase, setPhase] = useState<"idle" | "running" | "done">("idle");
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [patchOpen, setPatchOpen] = useState(false);
 
-  const steps = result ? deriveSteps(result, useLlm) : initialSteps();
+  const steps = result ? deriveSteps(result, useLlm, demoMode) : initialSteps();
 
   async function handleRun() {
     setPhase("running");
@@ -130,6 +136,7 @@ export default function App() {
         request: DEFAULT_INPUT.request,
         max_iterations: DEFAULT_INPUT.maxIterations,
         use_llm: useLlm,
+        demo_mode: demoMode,
       });
       setResult(data);
       setPhase("done");
@@ -199,6 +206,25 @@ export default function App() {
                 DeepSeek Repair（{useLlm ? "ON" : "OFF"}，Key 由 Backend 环境变量提供）
               </span>
             </label>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={demoMode}
+                onChange={(event) => setDemoMode(event.target.checked)}
+                disabled={phase === "running"}
+              />
+              <span>
+                Demo Mode（{demoMode ? "ON" : "OFF"}，Backend 注入确定性失败 —— 仅对默认 Demo
+                组合生效）
+              </span>
+            </label>
+            {demoMode && (
+              <div className="demo-notice inline">
+                Demo Mode 只允许 api_spec=openapi/petstore.yaml + project_path=demo_project，
+                其他组合会被 Backend 拒绝（DEMO_MODE_NOT_ALLOWED）。注入内容由 Backend 硬编码，
+                前端不发送任何文件路径或代码片段。
+              </div>
+            )}
             <button
               className="run-button"
               onClick={handleRun}

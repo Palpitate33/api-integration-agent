@@ -29,6 +29,11 @@ npm run dev
 
 - Project 输入区（默认值为 Backend 白名单内的合法路径：`openapi/petstore.yaml` / `demo_project`）+ Run Integration
 - DeepSeek Repair 开关（默认 OFF；ON 时 Backend 使用服务端 DEEPSEEK_API_KEY，前端不接收/保存任何 Key）
+- Demo Mode 开关（默认 OFF）：请求里只多带一个 `demo_mode: true`，由 Backend 在**固定 Demo 组合**
+  （`openapi/petstore.yaml` + `demo_project`）下注入确定性失败，用于展示
+  「初始测试失败 → DeepSeek 修复 → 复测通过 → Patch」完整闭环。
+  其他组合会被 Backend 拒绝（`DEMO_MODE_NOT_ALLOWED`）。前端**不发送**任何文件路径或代码片段，
+  注入内容全部由 Backend 硬编码（[`api_server/demo.py`](../src/integration_agent/api_server/demo.py)）
 - Agent Progress：8 个阶段的状态由真实 PipelineResult 一次性推导（无假实时）
 - Integration Plan：真实 `plan` 数据（plan 缺失时显示 unavailable）
 - Final Result：PASSED / TESTS FAILED / ERROR 三态 + 真实测试计数与修复轮数

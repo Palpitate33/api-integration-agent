@@ -71,6 +71,13 @@ body {
   font-size: 13px;
 }
 
+.demo-notice.inline {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 1fr 1fr;

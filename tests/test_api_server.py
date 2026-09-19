@@ -8,6 +8,7 @@
     5. path traversal                  12. Backend 不修改真实 repository
     6. 不存在的 project                13. CORS 行为
     7. Pipeline 正常返回                14. 错误响应结构
+                                        15. demo_mode 安全边界（仅固定 Demo 组合）
 """
 
 from importlib import import_module
@@ -168,6 +169,57 @@ def test_pipeline_exception_becomes_500(monkeypatch) -> None:
     assert "sk-abcdef" not in response.text
     assert "Traceback" not in response.text
     assert "RuntimeError" not in response.text
+
+
+# ------------------------------------------ 场景 15：demo_mode 安全边界
+
+
+def test_demo_mode_rejected_for_non_demo_target() -> None:
+    """demo_mode 只允许固定 Demo 组合，其余一律 400。"""
+    payload = {"api_spec": "openapi/petstore.yaml", "project_path": "demo_project/.."}
+    response = client.post("/api/integrations/run", json={**payload, "demo_mode": True})
+    assert response.status_code == 400
+    # 越界路径先被路径校验拦截（同一路径永远先过 paths.resolve_allowed）
+    assert response.json()["error"]["code"] == "INVALID_PROJECT_PATH"
+
+
+def test_demo_mode_rejected_when_target_not_the_fixed_demo() -> None:
+    """路径合法（spec 是文件、project 是目录）但不是固定 Demo 组合时，demo_mode 必须被拒绝。"""
+    response = client.post(
+        "/api/integrations/run",
+        json={"api_spec": "openapi/petstore.yaml", "project_path": "openapi", "demo_mode": True},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "DEMO_MODE_NOT_ALLOWED"
+    assert "demo_mode" in response.json()["error"]["message"]
+
+
+def test_demo_mode_injects_deterministic_failure() -> None:
+    """开启 demo_mode 后注入确定性失败：初始测试必然失败，不可能直接 passed。"""
+    response = client.post(
+        "/api/integrations/run",
+        json={**VALID_PAYLOAD, "demo_mode": True},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "tests_failed"
+    loop = body["repair_loop_result"]
+    assert loop["repair_plans"], "初始测试应失败并产生 RepairPlan"
+    assert loop["status"] != "passed"
+
+
+def test_demo_mode_defaults_off(healthy_run) -> None:
+    """不传 demo_mode 时行为与之前完全一致（普通请求不受影响）。"""
+    assert healthy_run.status_code == 200
+    assert healthy_run.json()["status"] == "passed"
+
+
+def test_demo_mode_does_not_touch_repository() -> None:
+    """demo_mode 只改内存产物，真实仓库文件不变。"""
+    before = _snapshot_dir(DEMO_PROJECT_PATH)
+    client.post("/api/integrations/run", json={**VALID_PAYLOAD, "demo_mode": True})
+    after = _snapshot_dir(DEMO_PROJECT_PATH)
+    assert before == after
 
 
 # ------------------------------------------- 场景 11：无 API Key 泄露

@@ -20,35 +20,14 @@ import argparse
 import sys
 from pathlib import Path
 
-from integration_agent.generation import DeterministicCodeGenerator, GeneratedArtifacts
+from integration_agent.api_server.demo import SabotagedGenerator
 from integration_agent.pipeline import run_pipeline
 from integration_agent.repair import DeepSeekLLMClient, StructuredLLMRepairApplier
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
-# 注入的确定性错误：把生成的单元测试断言改错，使初始测试必然失败
-SABOTAGE_FILE = "tests/test_demo_petstore_client.py"
-SABOTAGE_FROM = "assert result[0].id == 1"
-SABOTAGE_TO = "assert result[0].id == 2"
-
-
-class SabotagedGenerator:
-    """演示用生成器包装：在生成产物中注入一个确定性错误。
-
-    仅在 scripts 演示中使用；自动化测试与默认 demo 均不经过它。
-    """
-
-    def __init__(self) -> None:
-        self._inner = DeterministicCodeGenerator()
-
-    def generate(self, plan) -> GeneratedArtifacts:
-        artifacts = self._inner.generate(plan)
-        for item in artifacts.files:
-            if item.path == SABOTAGE_FILE:
-                if SABOTAGE_FROM not in item.content:
-                    raise RuntimeError(f"注入目标不存在于生成文件中：{SABOTAGE_FROM!r}")
-                item.content = item.content.replace(SABOTAGE_FROM, SABOTAGE_TO)
-        return artifacts
+# SabotagedGenerator 只有一份实现（api_server/demo.py，同时被 Backend 的 demo_mode 使用），
+# 此脚本直接复用，避免两处注入逻辑漂移。
 
 
 def main() -> int:

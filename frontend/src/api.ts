@@ -10,6 +10,8 @@ export interface RunIntegrationRequest {
   request: string;
   max_iterations: number;
   use_llm: boolean;
+  /** Demo-only：让 Backend 注入确定性失败（仅固定 Demo 组合生效）。 */
+  demo_mode: boolean;
 }
 
 // ---------------------------------------------------------------- 后端 PipelineResult 的
