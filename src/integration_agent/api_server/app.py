@@ -10,8 +10,10 @@
     - 不提供任意文件读取 / shell 执行 / git 命令 API。
     - 错误响应结构化（code + message），绝不返回 Python traceback。
     - API Key 只从服务端环境变量 DEEPSEEK_API_KEY 读取，不进入请求/响应模型。
-    - LLM 开关（use_llm / use_llm_repair / use_llm_planner）默认全关；
-      开启后仍不提供任何"用户自带 Key"的入口。
+    - LLM 开关（use_llm / use_llm_repair / use_llm_planner / use_agent_planner）
+      默认全关；开启后仍不提供任何"用户自带 Key"的入口。
+    - Agent Planner（use_agent_planner）与 DeepSeek Planner（use_llm_planner）
+      互斥，同时开启时只运行 ToolUsingPlanner：一次请求只会有一个 Planner。
     - CORS 只允许本地开发前端 origin（不允许 "*"）。
     - demo_mode（默认 false）只对固定 Demo 组合生效，注入内容在 demo.py 中硬编码，
       用户无法指定目标文件或替换内容；只改内存产物，不触碰真实仓库。
@@ -26,7 +28,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from integration_agent.agent import DeepSeekPlanner
+from integration_agent.agent import DeepSeekPlanner, ToolUsingPlanner
 from integration_agent.api_server.demo import DEMO_ONLY_MESSAGE, SabotagedGenerator, is_demo_target
 from integration_agent.api_server.models import IntegrationRunRequest
 from integration_agent.api_server.paths import resolve_allowed
@@ -128,20 +130,42 @@ def run_integration(payload: IntegrationRunRequest) -> PipelineResult:
     # LLM 开关互相独立：开启哪个就替换哪个组件，未开启的仍是确定性实现。
     # use_llm 保持既有语义（只影响修复），避免破坏已有调用方。
     use_repair = payload.use_llm or payload.use_llm_repair
-    if use_repair or payload.use_llm_planner:
-        try:
-            # 客户端本身无状态（只是配置 + generate），规划与修复共用一个实例
-            llm_client = DeepSeekLLMClient(json_mode=True)
-        except DeepSeekConfigError as exc:
-            # 错误消息只包含环境变量名，不包含 Key（DeepSeek 客户端已保证）
-            raise ApiError(400, "LLM_NOT_CONFIGURED", str(exc)) from exc
+    if use_repair or payload.use_llm_planner or payload.use_agent_planner:
+
+        def build_client(*, json_mode: bool) -> DeepSeekLLMClient:
+            """构造 DeepSeek 客户端；未配置 Key 时转成结构化 400。
+
+            错误消息只包含环境变量名，不包含 Key（DeepSeek 客户端已保证）。
+            """
+            try:
+                return DeepSeekLLMClient(json_mode=json_mode)
+            except DeepSeekConfigError as exc:
+                raise ApiError(400, "LLM_NOT_CONFIGURED", str(exc)) from exc
+
+        # 修复侧与 DeepSeek Planner 要求响应本身就是一段可解析的 JSON，因此
+        # json_mode=True；客户端无状态（只是配置 + generate/chat），两者共用一个实例。
+        json_client = build_client(json_mode=True)
 
         if use_repair:
-            kwargs["repair_applier"] = StructuredLLMRepairApplier(llm_client)
-        if payload.use_llm_planner:
-            # 规划失败不做静默 fallback：DeepSeekPlanner 抛异常 → Pipeline 记录
+            kwargs["repair_applier"] = StructuredLLMRepairApplier(json_client)
+        # Planner 选择顺序：Agent Planner > DeepSeek Planner > DeterministicPlanner。
+        # 三者**互斥**，只往 kwargs 里放一个 planner：两个开关同时打开时也只构造
+        # ToolUsingPlanner，绝不会让两个 Planner 先后各跑一遍。
+        if payload.use_agent_planner:
+            # Agent Planner 复用同一份已解析的 api / 已扫描的 project（Pipeline 只
+            # 构造一次 PlannerState），只读工具仅做补充观察，不重新解析、不重扫仓库。
+            #
+            # 这里必须换一个 json_mode=False 的客户端：Agent Loop 走的是 tool calling，
+            # 而真实 API 会拒绝 response_format=json_object 与 tools 同时出现
+            # （HTTP 400 "Prompt must contain the word 'json' to use 'response_format'
+            # of type 'json_object'"）；何况 json_object 会把整轮回答限制成一个 JSON
+            # 对象，与 tool_calls 这条输出通道互相打架。
+            kwargs["planner"] = ToolUsingPlanner(build_client(json_mode=False))
+        elif payload.use_llm_planner:
+            # 规划失败不做静默 fallback：Planner 抛异常 → Pipeline 记录
             # failed_stage="plan" 并以 status="error" 如实返回，由调用方决定是否重试。
-            kwargs["planner"] = DeepSeekPlanner(llm_client)
+            # 规划阶段失败**不进入** Repair Loop：Repair 只处理"代码生成之后的测试失败"。
+            kwargs["planner"] = DeepSeekPlanner(json_client)
 
     try:
         return run_pipeline(

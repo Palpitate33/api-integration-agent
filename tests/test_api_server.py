@@ -442,7 +442,8 @@ def fake_deepseek(monkeypatch) -> dict:
 
 
 def test_llm_switches_are_all_off_by_default(capture_pipeline) -> None:
-    """默认三个开关都关：注入的仍是确定性组件。"""
+    """默认四个开关（use_llm / use_llm_repair / use_llm_planner / use_agent_planner）都关：
+    注入的仍是确定性组件。"""
     client.post("/api/integrations/run", json=VALID_PAYLOAD)
 
     assert "planner" not in capture_pipeline
