@@ -130,12 +130,19 @@ class StructuredLLMRepairApplier:
         changes: list[LLMFileChange],
         plan: RepairPlan,
     ) -> tuple[list[RepairAction], list[RepairAction], list[str]]:
-        """逐条校验并应用 LLM 修改；任何问题只跳过该条并记录 warning。"""
+        """逐条校验并应用 LLM 修改；任何问题只跳过该条并记录 warning。
+
+        授权是一道**独立、显式**的门：只有 RepairPlan.actions 明确列出的文件才可读写。
+        prompt 中的"只能修改上面列出的目标文件"只是提示，LLM 输出的置信度也不是授权
+        依据——否则被篡改的测试文件可以混进产物，让 pytest 假通过。
+        """
         applied: list[RepairAction] = []
         skipped: list[RepairAction] = []
         warnings: list[str] = []
         files_by_path = {item.path: item for item in repaired.files}
         plan_confidence = {action.file: action.confidence for action in plan.actions}
+        # 授权白名单只来自计划的 actions：既不来自 LLM 输出，也没有任何默认放行值。
+        allowed_paths = {action.file for action in plan.actions}
         seen_paths: set[str] = set()
         total_chars = 0
 
@@ -150,6 +157,13 @@ class StructuredLLMRepairApplier:
                 skipped.append(_record(change, "重复修改同一个文件"))
                 continue
             seen_paths.add(change.path)
+
+            if change.path not in allowed_paths:
+                # 授权检查先于"目标是否存在/是否已是完整文件"：不在计划范围内就根本不碰，
+                # modify 与 create 同等对待（create 一个新测试文件同样是逃逸路径）。
+                warnings.append(f"跳过修改：{change.path} 不在 RepairPlan.actions 授权的文件范围内")
+                skipped.append(_record(change, "未获得 RepairPlan.actions 授权"))
+                continue
 
             existing = files_by_path.get(change.path)
             if change.action == "modify":
@@ -213,7 +227,9 @@ class StructuredLLMRepairApplier:
                     reason=change.reason or "LLM 生成修改",
                     target=None,
                     changes="LLM 输出完整文件内容",
-                    confidence=plan_confidence.get(change.path, 0.5),
+                    # 走到这里必然已通过授权检查，plan_confidence 一定有该 path；
+                    # 去掉 0.5 默认值，避免"未授权"被伪装成"低置信度"。
+                    confidence=plan_confidence[change.path],
                 )
             )
         return applied, skipped, warnings
@@ -292,7 +308,7 @@ def build_repair_prompt(
         '"content": "...", "reason": "..."}], "summary": "...", "warnings": [...]}',
         "3. modify 的 content 是修改后的完整文件内容；create 的 content 是新文件完整内容。",
         "4. path 必须是相对路径：禁止 ../、禁止绝对路径（如 /etc/x、C:\\\\x）。",
-        "5. 只能修改上面列出的目标文件；create 可以新增文件，但不要创建无关文件。",
+        "5. 只能修改或创建上面列出的目标文件；不在计划内的文件会被直接拒绝。",
         "6. 无法安全修改时返回空 changes，并在 warnings 中说明原因。",
     ]
     return "\n".join(lines)
