@@ -305,3 +305,192 @@ def test_deterministic_output() -> None:
         )
 
     assert run_once() == run_once()
+
+
+# --------------------------- 场景 14-18：RepairLoop.status → PipelineResult.status
+#
+# invariant：RepairLoopResult.status == "error" ⇒ PipelineResult.status == "error"。
+# error 表示"流程自身坏了"（TestRunner / RepairPlanner / RepairApplier 抛异常），
+# tests_failed 表示"测试确实跑了并且没通过"。二者混同会丢掉"该重试还是该改代码"
+# 的判断依据，也会让不可信的测试结论被当成真实结论。
+
+# failed_stage 的合法取值（parse/scan/plan/generate/repair）：repair 由本组测试引入。
+LEGAL_STAGES = {"parse", "scan", "plan", "generate", "repair"}
+
+
+class RaisingApplier:
+    """apply 时抛异常的假 Applier：制造真实的 RepairLoopResult(status="error")。"""
+
+    def apply(self, artifacts, plan) -> repair.RepairApplicationResult:
+        raise RuntimeError("applier boom: C:/secret/path.py")
+
+
+class OnePlanPlanner:
+    """固定返回同一份 RepairPlan 的假 Planner。"""
+
+    def __init__(self, plan: repair.RepairPlan) -> None:
+        self._plan = plan
+        self.calls = 0
+
+    def plan(self, artifacts, test_result) -> repair.RepairPlan:
+        self.calls += 1
+        return self._plan
+
+
+def _not_repairable_plan() -> repair.RepairPlan:
+    """should_repair=False 的计划（actions 必须为空，由模型校验）。"""
+    return repair.RepairPlan(
+        should_repair=False,
+        failure_category="assertion",
+        analysis="断言失败",
+        actions=[],
+    )
+
+
+def _run_with_applier(applier) -> pipeline.PipelineResult:
+    return pipeline.run_pipeline(
+        PETSTORE_PATH,
+        DEMO_PROJECT_PATH,
+        test_runner=FakeRunner([_failed()]),
+        repair_applier=applier,
+    )
+
+
+# ---------------------------------------------------------------- Test 1 + Test 4
+
+
+def test_repair_loop_error_maps_to_pipeline_error() -> None:
+    """RepairLoop 内部异常必须原样保留为 error，不得被压缩成 tests_failed。"""
+    result = _run_with_applier(RaisingApplier())
+
+    # 前置条件：RepairLoop 自己确实返回了 error（不是我们构造的假终态）
+    assert result.repair_loop_result is not None
+    assert result.repair_loop_result.status == "error"
+
+    assert result.status == "error"
+    assert result.status != "tests_failed"
+    # 产物仍然保留，便于事后排查
+    assert result.artifacts is not None
+
+
+def test_repair_loop_error_sets_legal_repair_stage() -> None:
+    """failed_stage 必须定位到 repair，且取值在项目既有的 stage 命名体系内。"""
+    result = _run_with_applier(RaisingApplier())
+
+    assert result.failed_stage == "repair"
+    assert result.failed_stage in LEGAL_STAGES
+
+
+def test_repair_error_distinguishable_from_test_failure() -> None:
+    """同一个失败输入，两种成因必须给出不同的 status（这正是本修复的目的）。"""
+    loop_error = _run_with_applier(RaisingApplier())
+    test_failed = _run_with_applier(
+        FakeApplier(
+            repair.RepairApplicationResult(
+                artifacts=generation.GeneratedArtifacts(files=[], summary="fake"),
+                changed=False,  # 有计划但应用层无产出 → no_progress
+            )
+        )
+    )
+
+    assert loop_error.status == "error"
+    assert test_failed.status == "tests_failed"
+    assert loop_error.status != test_failed.status
+    assert loop_error.failed_stage == "repair"
+    assert test_failed.failed_stage is None
+
+
+# ------------------------------------------------------------------------- Test 5
+
+
+def test_repair_error_details_preserved_without_leaking() -> None:
+    """错误信息不因映射而丢失，同时不把 traceback / 绝对路径 / 异常原文带到响应里。"""
+    result = _run_with_applier(RaisingApplier())
+
+    # 信息保留：安全文案提升到 Pipeline 层，循环的 warnings 也照常汇聚
+    assert result.error == result.repair_loop_result.error
+    assert result.error
+    assert result.repair_loop_result.warnings
+    for warning in result.repair_loop_result.warnings:
+        assert warning in result.warnings
+    # 嵌套结构里的错误信息仍在（可追溯是哪个组件坏的）
+    assert "RepairApplier" in (result.repair_loop_result.error or "")
+
+    # 不泄露：沿用项目既有的安全处理
+    _assert_no_internal_details(result)
+    joined = "\n".join([result.error or "", *result.warnings])
+    assert "applier boom" not in joined  # 异常原文（可能夹带路径）
+    assert "secret" not in joined
+
+
+# ----------------------------------------------------------------- Test 2 + Test 3
+
+
+def test_repair_loop_passed_still_maps_to_passed() -> None:
+    """Test 2：Repair Loop 修好了 → passed，且没有 failed_stage / error。"""
+    result = pipeline.run_pipeline(
+        PETSTORE_PATH,
+        DEMO_PROJECT_PATH,
+        test_runner=FakeRunner([_failed(), _passed()]),
+        repair_applier=FakeApplier(
+            repair.RepairApplicationResult(
+                artifacts=generation.GeneratedArtifacts(files=[], summary="fake"),
+                changed=True,
+            )
+        ),
+    )
+
+    assert result.repair_loop_result.status == "passed"
+    assert result.status == "passed"
+    assert result.failed_stage is None
+    assert result.error is None
+
+
+def test_repair_loop_no_progress_still_maps_to_tests_failed() -> None:
+    """Test 2：测试真的失败了且修复无产出 → 仍然 tests_failed。"""
+    result = _run_with_applier(
+        FakeApplier(
+            repair.RepairApplicationResult(
+                artifacts=generation.GeneratedArtifacts(files=[], summary="fake"),
+                changed=False,
+            )
+        )
+    )
+
+    assert result.repair_loop_result.status == "no_progress"
+    assert result.status == "tests_failed"
+    assert result.failed_stage is None
+    assert result.error is None
+
+
+def test_repair_loop_max_iterations_still_maps_to_tests_failed() -> None:
+    """Test 2：修复次数耗尽 → 仍然 tests_failed（未被本次修复波及）。"""
+    result = pipeline.run_pipeline(
+        PETSTORE_PATH,
+        DEMO_PROJECT_PATH,
+        test_runner=FakeRunner([_failed(), _failed(), _failed(), _failed()]),
+        repair_applier=FakeApplier(
+            repair.RepairApplicationResult(
+                artifacts=generation.GeneratedArtifacts(files=[], summary="fake"),
+                changed=True,
+            )
+        ),
+    )
+
+    assert result.repair_loop_result.status == "max_iterations"
+    assert result.status == "tests_failed"
+    assert result.failed_stage is None
+
+
+def test_repair_loop_not_repairable_still_maps_to_tests_failed() -> None:
+    """Test 2：计划判定不可修复 → 仍然 tests_failed（未被本次修复波及）。"""
+    result = pipeline.run_pipeline(
+        PETSTORE_PATH,
+        DEMO_PROJECT_PATH,
+        test_runner=FakeRunner([_failed()]),
+        repair_planner=OnePlanPlanner(_not_repairable_plan()),
+    )
+
+    assert result.repair_loop_result.status == "not_repairable"
+    assert result.status == "tests_failed"
+    assert result.failed_stage is None

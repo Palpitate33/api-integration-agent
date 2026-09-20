@@ -7,8 +7,9 @@
     - status 三态：
         passed        测试全部通过（RepairLoop 返回 passed）
         tests_failed  流程走完但最终测试未通过（RepairLoop 的
-                      max_iterations / no_progress / not_repairable / error 归一）
-        error         Pipeline 自身的前置阶段（parse/scan/plan/generate）异常
+                      max_iterations / no_progress / not_repairable 归一）
+        error         流程自身异常：前置阶段（parse/scan/plan/generate）或
+                      RepairLoop 内部（failed_stage="repair"）
 """
 
 from typing import Literal
@@ -37,6 +38,6 @@ class PipelineResult(BaseModel):
     # 因此该字段保持 None（除非将来 Loop 显式提供）。
     repair_loop_result: RepairLoopResult | None = None
     patch: PatchResult | None = None  # 最终修改结果；前置阶段失败时为 None
-    failed_stage: str | None = None  # status="error" 时定位：parse/scan/plan/generate
+    failed_stage: str | None = None  # status="error" 时定位：parse/scan/plan/generate/repair
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None  # status="error" 时的异常说明（完整 traceback 在 warnings 中）

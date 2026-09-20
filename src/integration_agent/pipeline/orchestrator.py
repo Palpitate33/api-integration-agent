@@ -29,8 +29,12 @@
 
 状态映射：
     RepairLoop.status == "passed"                  → Pipeline "passed"
-    max_iterations / no_progress / not_repairable / error → Pipeline "tests_failed"
-    前置阶段（parse/scan/plan/generate）异常           → Pipeline "error"（failed_stage 定位）
+    max_iterations / no_progress / not_repairable   → Pipeline "tests_failed"
+    RepairLoop.status == "error"                   → Pipeline "error"（failed_stage="repair"）
+    前置阶段（parse/scan/plan/generate）异常          → Pipeline "error"（failed_stage 定位）
+
+    tests_failed 与 error 的区别是"谁坏了"：前者是测试确实跑了但没通过，
+    后者是流程自身出错（测试结论不可信，也不代表代码有问题）。
 """
 
 import logging
@@ -189,7 +193,21 @@ class IntegrationPipeline:
             warnings.append(f"Patch 生成失败：{type(exc).__name__}: {exc}")
             patch_result = None
 
-        status = "passed" if loop_result.status == "passed" else "tests_failed"
+        # 状态映射：RepairLoop 的 error 表示"流程自身出错"（TestRunner / RepairPlanner /
+        # RepairApplier 抛异常），与"测试确实执行了并且没通过"是两回事，不能归一成
+        # tests_failed——否则调用方既无法判断该重试还是该改代码，又会把不可信的测试
+        # 结论当成真实结论。
+        if loop_result.status == "error":
+            status = "error"
+            failed_stage = "repair"
+            # loop_result.error 已是安全文案（"Repair loop failed during X."），
+            # 完整 traceback 只进服务端日志，因此可原样提升到 Pipeline 层。
+            error = loop_result.error or "Repair loop failed."
+        else:
+            status = "passed" if loop_result.status == "passed" else "tests_failed"
+            failed_stage = None
+            error = None
+
         return PipelineResult(
             status=status,
             api=api,
@@ -199,7 +217,9 @@ class IntegrationPipeline:
             initial_test_result=None,  # 当前 RepairLoop 不保存初始测试结果，不重复跑测试
             repair_loop_result=loop_result,
             patch=patch_result,
+            failed_stage=failed_stage,
             warnings=warnings,
+            error=error,
         )
 
     @staticmethod
