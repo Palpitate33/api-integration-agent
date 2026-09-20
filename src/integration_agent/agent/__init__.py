@@ -14,6 +14,7 @@
 约束：Planner 只分析、只规划——不修改仓库、不创建文件、不执行 shell 命令。
 """
 
+from integration_agent.agent.agent_loop import AgentLoop, AgentLoopConfig, AgentRunResult
 from integration_agent.agent.deepseek_planner import (
     DeepSeekPlanner,
     DeepSeekPlannerError,
@@ -47,8 +48,12 @@ from integration_agent.agent.planner import (
     plan_integration,
 )
 from integration_agent.agent.state import CodeEvidence, PlannerState
+from integration_agent.agent.tool_planner import ToolUsingPlanner
 
 __all__ = [
+    "AgentLoop",
+    "AgentLoopConfig",
+    "AgentRunResult",
     "DEFAULT_HTTP_CLIENT",
     "DEFAULT_MAX_ENDPOINTS",
     "KNOWN_HTTP_CLIENTS",
@@ -75,6 +80,7 @@ __all__ = [
     "TargetAPI",
     "TestSpec",
     "TestingStrategy",
+    "ToolUsingPlanner",
     "api_slug",
     "plan_integration",
 ]
