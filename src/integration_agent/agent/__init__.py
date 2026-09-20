@@ -14,6 +14,12 @@
 约束：Planner 只分析、只规划——不修改仓库、不创建文件、不执行 shell 命令。
 """
 
+from integration_agent.agent.deepseek_planner import (
+    DeepSeekPlanner,
+    DeepSeekPlannerError,
+    DeepSeekPlannerParseError,
+    DeepSeekPlannerValidationError,
+)
 from integration_agent.agent.models import (
     AuthenticationPlan,
     DependencyRequirement,
@@ -48,6 +54,10 @@ __all__ = [
     "KNOWN_HTTP_CLIENTS",
     "AuthenticationPlan",
     "CodeEvidence",
+    "DeepSeekPlanner",
+    "DeepSeekPlannerError",
+    "DeepSeekPlannerParseError",
+    "DeepSeekPlannerValidationError",
     "DependencyRequirement",
     "DeterministicPlanner",
     "ErrorHandlingPlan",

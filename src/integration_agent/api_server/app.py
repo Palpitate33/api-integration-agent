@@ -10,6 +10,8 @@
     - 不提供任意文件读取 / shell 执行 / git 命令 API。
     - 错误响应结构化（code + message），绝不返回 Python traceback。
     - API Key 只从服务端环境变量 DEEPSEEK_API_KEY 读取，不进入请求/响应模型。
+    - LLM 开关（use_llm / use_llm_repair / use_llm_planner）默认全关；
+      开启后仍不提供任何"用户自带 Key"的入口。
     - CORS 只允许本地开发前端 origin（不允许 "*"）。
     - demo_mode（默认 false）只对固定 Demo 组合生效，注入内容在 demo.py 中硬编码，
       用户无法指定目标文件或替换内容；只改内存产物，不触碰真实仓库。
@@ -24,6 +26,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from integration_agent.agent import DeepSeekPlanner
 from integration_agent.api_server.demo import DEMO_ONLY_MESSAGE, SabotagedGenerator, is_demo_target
 from integration_agent.api_server.models import IntegrationRunRequest
 from integration_agent.api_server.paths import resolve_allowed
@@ -122,12 +125,23 @@ def run_integration(payload: IntegrationRunRequest) -> PipelineResult:
             raise ApiError(400, "DEMO_MODE_NOT_ALLOWED", DEMO_ONLY_MESSAGE)
         kwargs["code_generator"] = SabotagedGenerator()
 
-    if payload.use_llm:
+    # LLM 开关互相独立：开启哪个就替换哪个组件，未开启的仍是确定性实现。
+    # use_llm 保持既有语义（只影响修复），避免破坏已有调用方。
+    use_repair = payload.use_llm or payload.use_llm_repair
+    if use_repair or payload.use_llm_planner:
         try:
-            kwargs["repair_applier"] = StructuredLLMRepairApplier(DeepSeekLLMClient(json_mode=True))
+            # 客户端本身无状态（只是配置 + generate），规划与修复共用一个实例
+            llm_client = DeepSeekLLMClient(json_mode=True)
         except DeepSeekConfigError as exc:
             # 错误消息只包含环境变量名，不包含 Key（DeepSeek 客户端已保证）
             raise ApiError(400, "LLM_NOT_CONFIGURED", str(exc)) from exc
+
+        if use_repair:
+            kwargs["repair_applier"] = StructuredLLMRepairApplier(llm_client)
+        if payload.use_llm_planner:
+            # 规划失败不做静默 fallback：DeepSeekPlanner 抛异常 → Pipeline 记录
+            # failed_stage="plan" 并以 status="error" 如实返回，由调用方决定是否重试。
+            kwargs["planner"] = DeepSeekPlanner(llm_client)
 
     try:
         return run_pipeline(

@@ -164,3 +164,6 @@ class IntegrationPlan(BaseModel):
     testing_strategy: TestingStrategy
     assumptions: list[str] = Field(default_factory=list)
     risks: list[Risk] = Field(default_factory=list)
+    # 规划过程中的不确定性说明（LLM Planner 的"证据不足"记录 + 约束层发现的问题）。
+    # 确定性的 DeterministicPlanner 不使用该字段，默认空列表。
+    warnings: list[str] = Field(default_factory=list)
