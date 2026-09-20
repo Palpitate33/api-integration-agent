@@ -10,10 +10,17 @@
 以及：Protocol 一致性、Pydantic 契约、工作区清理、依赖离线处理、
 modify 片段不落地、路径越界防护、无测试可收集等边界。
 
+再加上 subprocess 环境隔离（P1-4）：父进程环境默认不进入 pytest 子进程，
+宿主凭证无法被生成代码通过 os.environ 读到。凭据相关断言一律走
+**真实 TestRunner → subprocess → pytest → 生成测试** 这条链路，
+而不是只检查 build_subprocess_env() 的返回值。
+
 注：统一通过 validation. / generation. 前缀引用；TestResult / TestRunner
 若直接 import 进测试模块命名空间，会被 pytest 误当作测试类收集。
+本模块只使用自造的 sentinel 值，既不读取也不输出宿主的真实凭证。
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -367,3 +374,234 @@ def test_failure_detail_model_typed() -> None:
     )
     assert result.failure_details
     assert all(isinstance(item, validation.FailureDetail) for item in result.failure_details)
+
+
+# -------------------------------------------- P1-4：subprocess 环境隔离
+#
+# 生成产物与生成测试都是不可信代码，它们在 pytest 子进程里可以直接读 os.environ。
+# 若子进程整体继承父进程环境（env = os.environ.copy()），宿主凭证就会暴露给它们。
+#
+# 下面用**自造 sentinel** 证明隔离生效：断言只涉及"sentinel 取值 / 变量名是否出现"，
+# 全程不读取、不写入、不打印宿主的任何真实凭证。
+# 生产代码里没有这些值——它们只存在于本测试模块。
+
+SECRET_SENTINELS = {
+    "DEEPSEEK_API_KEY": "test-secret-sentinel",
+    "OPENAI_API_KEY": "openai-secret-sentinel",
+    "AWS_SECRET_ACCESS_KEY": "aws-secret-sentinel",
+    "DATABASE_URL": "database-secret-sentinel",
+}
+
+# 子进程环境 = allowlist + 本模块显式设定的两项（不继承父进程）
+_EXPLICIT_ENV = {"PYTHONPATH", "PYTHONIOENCODING"}
+
+
+def _spy_test(body: str) -> str:
+    """生成一个在子进程里运行的"间谍测试"文件，供 TestRunner 真实执行。"""
+    return "import os\n\n\n" + body
+
+
+def _leak_probe() -> str:
+    """检查父进程 sentinel 是否泄漏给子进程。
+
+    断言信息只列变量名、不含取值——万一将来隔离被破坏，测试报告也不会
+    把凭证内容抄进日志 / TestResult。
+    """
+    return _spy_test(
+        f"SENTINELS = {SECRET_SENTINELS!r}\n"
+        "\n"
+        "\n"
+        "def test_secret_values_not_visible():\n"
+        "    leaked = [n for n, v in SENTINELS.items() if os.environ.get(n) == v]\n"
+        "    assert leaked == [], leaked\n"
+        "\n"
+        "\n"
+        "def test_secret_names_absent():\n"
+        "    leaked = [n for n in SENTINELS if n in os.environ]\n"
+        "    assert leaked == [], leaked\n"
+    )
+
+
+# ------------------------------------- §十五 1-4：四个凭证变量逐个验证
+
+
+@pytest.mark.parametrize("name", sorted(SECRET_SENTINELS))
+def test_parent_secret_not_visible_in_subprocess(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """父进程设 sentinel → 真实跑 TestRunner → 生成测试读 os.environ → 必须 passed。
+
+    每个参数只设置一个变量，构成单变量对照：泄漏与否直接归因到该变量。
+    """
+    monkeypatch.setenv(name, SECRET_SENTINELS[name])
+
+    result = validation.run_tests(_artifacts({"tests/test_leak_probe.py": _leak_probe()}))
+
+    assert result.status == "passed"
+    assert result.passed == 2  # 两个探针都真的跑到了，不是"没收集到测试"
+    assert result.failed == 0
+
+
+# ------------------------ §十五 6：必要运行环境仍然存在（以实际行为为准）
+
+
+def test_required_runtime_env_reaches_child() -> None:
+    """pytest 自身启动所需的环境变量必须照常传给子进程。
+
+    期望集合由**当前 allowlist ∩ 当前父进程环境**推导，因此不写死平台差异：
+    Windows 需要 SystemRoot，Linux 上则没有它，两者都应通过。
+    """
+    present = {name.upper() for name in os.environ}
+    expected = sorted(
+        n.upper() for n in validation.SUBPROCESS_ENV_ALLOWLIST if n.upper() in present
+    )
+    assert "PATH" in expected  # 任何平台都必须有可执行文件搜索路径
+
+    probe = _spy_test(
+        f"EXPECTED = {expected!r}\n"
+        "\n"
+        "\n"
+        "def test_allowlisted_env_visible():\n"
+        "    present = {name.upper() for name in os.environ}\n"
+        "    missing = [n for n in EXPECTED if n not in present]\n"
+        "    assert missing == [], missing\n"
+    )
+    result = validation.run_tests(_artifacts({"tests/test_runtime_env.py": probe}))
+
+    assert result.status == "passed"
+    assert result.passed == 1
+
+
+def test_parent_env_is_not_inherited_wholesale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """结构性不变量：父进程的环境变量不会进入子进程——**不管它叫什么名字**。
+
+    这是 allowlist 相对黑名单的核心价值：断言不依赖任何具体凭证名，
+    因此将来新增的凭证默认也是安全的。
+
+    不断言"子进程环境里只有 allowlist"：pytest 自己会在子进程内设置
+    PYTEST_CURRENT_TEST / PYTEST_VERSION 之类的变量，那不是继承来的。
+    这里断言的是"继承"这件事本身没有发生。
+
+    名字比较按大小写归一：Windows 会把变量名归一成大写（SystemRoot → SYSTEMROOT），
+    而 Windows 的变量名查询本来就大小写不敏感，归一后比较才是等价的。
+    """
+    marker = "apiforge-parent-only-value"
+    planted = {f"APIFORGE_PARENT_VAR_{index}": marker for index in range(3)}
+    planted.update(SECRET_SENTINELS)
+    planted["SOME_FUTURE_CREDENTIAL"] = marker
+    for name, value in planted.items():
+        monkeypatch.setenv(name, value)
+
+    probe = _spy_test(
+        f"MARKER = {marker!r}\n"
+        f"NAMES = {sorted(planted)!r}\n"
+        "\n"
+        "\n"
+        "def test_parent_names_absent():\n"
+        "    present = {n.upper() for n in os.environ}\n"
+        "    leaked = [n for n in NAMES if n.upper() in present]\n"
+        "    assert leaked == [], leaked\n"
+        "\n"
+        "\n"
+        "def test_no_parent_value_anywhere():\n"
+        "    tainted = sum(1 for v in os.environ.values() if MARKER in v)\n"
+        "    assert tainted == 0, f'父进程的值出现在子进程环境里：{tainted} 处'\n"
+    )
+    result = validation.run_tests(_artifacts({"tests/test_env_inherit.py": probe}))
+
+    assert result.status == "passed"
+    assert result.passed == 2
+
+
+# ------------------------------------------- §十五 5：正常 pytest 语义完整
+
+
+def test_normal_pytest_semantics_under_sanitized_env() -> None:
+    """隔离后普通 pytest 照常工作：通过 / 失败 / skip 三类仍分别统计与定位。"""
+    result = validation.run_tests(
+        _artifacts(
+            {
+                "tests/test_ok.py": PASSING_TEST,
+                "tests/test_fail.py": "def test_failure():\n    assert 1 == 2\n",
+                "tests/test_skip.py": (
+                    "import pytest\n\n\n"
+                    '@pytest.mark.skip(reason="later")\n'
+                    "def test_skip():\n"
+                    "    assert False\n"
+                ),
+            }
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert (result.passed, result.failed, result.skipped) == (1, 1, 1)
+    assert [detail.test_name for detail in result.failure_details] == ["test_failure"]
+    assert result.failure_details[0].file == "tests/test_fail.py"
+
+
+# ------------------------------------------------ §十五 7：Deterministic
+
+
+def test_env_isolation_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """同一份探针连跑两次，核心结果一致——隔离是稳定生效的，不是偶发。"""
+    for name, sentinel in SECRET_SENTINELS.items():
+        monkeypatch.setenv(name, sentinel)
+    artifacts = _artifacts({"tests/test_leak_probe.py": _leak_probe()})
+
+    first = validation.run_tests(artifacts)
+    second = validation.run_tests(artifacts)
+
+    assert _core(first) == _core(second)
+    assert first.status == "passed"
+
+
+# ------------------------------------- build_subprocess_env 的单元级契约
+
+
+def test_build_subprocess_env_keeps_only_allowlist(tmp_path: Path) -> None:
+    base = {name: "keep" for name in validation.SUBPROCESS_ENV_ALLOWLIST}
+    base.update(
+        {
+            **SECRET_SENTINELS,
+            "GITHUB_TOKEN": "x",
+            "SOME_FUTURE_CREDENTIAL": "x",
+        }
+    )
+
+    env = validation.build_subprocess_env(tmp_path, base=base)
+
+    assert set(env) == set(validation.SUBPROCESS_ENV_ALLOWLIST) | _EXPLICIT_ENV
+    assert env["PYTHONPATH"] == str(tmp_path)
+    assert env["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_build_subprocess_env_overrides_parent_python_settings(tmp_path: Path) -> None:
+    """父进程的 PYTHONPATH / PYTHONIOENCODING 不被继承（否则可绕过工作区隔离）。"""
+    base = {"PATH": "/usr/bin", "PYTHONPATH": "/host/site-packages", "PYTHONIOENCODING": "cp1252"}
+
+    env = validation.build_subprocess_env(tmp_path, base=base)
+
+    assert env["PYTHONPATH"] == str(tmp_path)
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_build_subprocess_env_tolerates_missing_vars(tmp_path: Path) -> None:
+    """父进程缺少（或平台没有）某个 allowlist 变量时不得报错。"""
+    env = validation.build_subprocess_env(tmp_path, base={})
+
+    assert set(env) == _EXPLICIT_ENV
+
+
+def test_allowlist_contains_no_credential_shaped_names() -> None:
+    """结构性守卫：allowlist 里不允许出现"名字就像凭证"的变量。"""
+    markers = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "API")
+
+    offenders = [
+        name
+        for name in validation.SUBPROCESS_ENV_ALLOWLIST
+        if any(marker in name.upper() for marker in markers)
+    ]
+
+    assert offenders == []

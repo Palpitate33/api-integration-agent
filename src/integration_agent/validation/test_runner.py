@@ -15,6 +15,8 @@
     - 绝不修改真实 Repository（只写 TemporaryDirectory）。
     - 绝不联网安装依赖（默认 OfflineDependencyPreparer 只检查当前解释器可导入性）。
     - 绝不修复失败代码：TestResult(status="failed") 即终点，Repair Loop 是下一阶段。
+    - 子进程只拿到最小环境（build_subprocess_env）：生成代码属于不可信代码，
+      不能通过 os.environ 读到宿主进程的 API 凭证。
 """
 
 import importlib.util
@@ -24,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -32,6 +35,38 @@ from integration_agent.validation.models import FailureDetail, TestResult
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_PYTEST_ARGS = ("-q", "-ra", "--tb=short")
+
+# 子进程环境 allowlist：**默认拒绝，明确放行**。
+#
+# 为什么用 allowlist 而不是"复制 os.environ 再删掉已知 secret"：黑名单只能挡住
+# 今天想得到的名字（DEEPSEEK_API_KEY / AWS_* / ...），挡不住明天新增的凭证
+# （CI 注入的新 token、.env 风格的新命名）。allowlist 的结构保证"没被列出的
+# 变量一律不进入子进程"，新增凭证默认是安全的。
+#
+# 只放行 Python / pytest 启动所必需、且**本身不携带凭证**的变量。
+# 每一项都由 tests/test_test_runner.py 的隔离测试与全量 pytest 守着。
+SUBPROCESS_ENV_ALLOWLIST = (
+    # 可执行文件与 DLL 解析。SystemRoot 是硬需求：Windows 上缺失会让子进程
+    # 直接起不来（socket 初始化失败 → OSError WinError 10106）。
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    # 临时目录：pytest 与 tempfile 都要写文件
+    "TEMP",
+    "TMP",
+    # 用户主目录：Path.home()、pytest 缓存目录、生成代码里的 ~ 展开
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    # 语言 / 编码（PYTHONIOENCODING 由本模块显式设定，不继承）
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+)
 
 # pytest 摘要行中的数量词 → TestResult 字段名（"1 error" / "2 errors" 同义）
 _SUMMARY_KEYS = {
@@ -78,6 +113,26 @@ class OfflineDependencyPreparer:
 def run_tests(artifacts: GeneratedArtifacts) -> TestResult:
     """便捷入口：默认使用 DeterministicTestRunner。"""
     return DeterministicTestRunner().run(artifacts)
+
+
+def build_subprocess_env(workspace: Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """构建 pytest 子进程的最小环境：父进程环境**默认不继承**。
+
+    生成产物与生成测试都是不可信代码，它们可以在 pytest 子进程里直接读
+    ``os.environ``。若整体继承，宿主进程的 DEEPSEEK_API_KEY / OPENAI_API_KEY /
+    AWS_SECRET_ACCESS_KEY / DATABASE_URL 等凭证会直接暴露给这些代码。
+
+    因此这里只按 SUBPROCESS_ENV_ALLOWLIST 放行 Python / pytest 启动所必需、
+    且本身不携带凭证的变量，其余（含一切凭证类变量）一律不进入子进程。
+
+    base 仅用于测试注入（默认读取当前进程的 os.environ），生产路径不传。
+    """
+    source = os.environ if base is None else base
+    env = {name: source[name] for name in SUBPROCESS_ENV_ALLOWLIST if name in source}
+    # PYTHONPATH 不继承父进程：生成代码只能 import 工作区内的模块与已安装的包。
+    env["PYTHONPATH"] = str(workspace)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 class DeterministicTestRunner:
@@ -141,9 +196,8 @@ class DeterministicTestRunner:
         (workspace / "pyproject.toml").write_text(content, encoding="utf-8")
 
     def _run_pytest(self, workspace: Path, dependency_warnings: list[str]) -> TestResult:
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(workspace) + os.pathsep + env.get("PYTHONPATH", "")
-        env["PYTHONIOENCODING"] = "utf-8"
+        # 最小环境：不继承父进程环境，见 build_subprocess_env
+        env = build_subprocess_env(workspace)
         command = [sys.executable, "-m", "pytest", *self.pytest_args]
         start = time.monotonic()
         try:
