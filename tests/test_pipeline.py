@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from integration_agent import generation, pipeline, repair, validation
+from integration_agent import generation, llm, pipeline, repair, validation
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 PETSTORE_PATH = EXAMPLES / "openapi" / "petstore.yaml"
@@ -174,7 +174,7 @@ def test_llm_applier_injection() -> None:
             "warnings": [],
         }
     )
-    llm_applier = repair.StructuredLLMRepairApplier(repair.FakeLLMClient(llm_response))
+    llm_applier = repair.StructuredLLMRepairApplier(llm.FakeLLMClient(llm_response))
 
     result = pipeline.run_pipeline(
         PETSTORE_PATH, DEMO_PROJECT_PATH, test_runner=runner, repair_applier=llm_applier

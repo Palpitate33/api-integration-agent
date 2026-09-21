@@ -61,12 +61,12 @@ from integration_agent.agent.deepseek_planner import (
     sanitize,
     validate_plan,
 )
-from integration_agent.agent.llm import ToolCallingClient
 from integration_agent.agent.models import IntegrationPlan
 from integration_agent.agent.planner import DEFAULT_MAX_ENDPOINTS, PlanningError
 from integration_agent.agent.prompt import DEFAULT_MAX_PROMPT_CHARS
 from integration_agent.agent.state import PlannerState
 from integration_agent.agent.tool_prompt import build_tool_planner_prompts
+from integration_agent.llm import ToolCallingClient
 from integration_agent.tools import build_default_registry
 from integration_agent.tools.registry import ToolContext, ToolRegistry
 

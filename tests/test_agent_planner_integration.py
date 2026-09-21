@@ -32,11 +32,12 @@ from integration_agent.agent import (
     ToolUsingPlanner,
 )
 from integration_agent.agent.agent_loop import AgentLoopRunner
-from integration_agent.agent.llm import AssistantTurn, FakeToolCallingClient, ToolCallRequest
 from integration_agent.api import parse_openapi
 from integration_agent.api_server.app import app
+from integration_agent.llm import AssistantTurn, FakeToolCallingClient, ToolCallRequest
 from integration_agent.pipeline import orchestrator
 from integration_agent.repository import scan_repository
+from integration_agent.tools import ToolSpec
 
 # 注意：api_server/__init__.py 把包属性 app 绑定为 FastAPI 实例，
 # 因此用 import_module 直接取 app 模块对象，供 monkeypatch 使用。
@@ -341,8 +342,13 @@ def test_multi_round_tool_calling_ends_with_a_plan(monkeypatch) -> None:
     assert len(observations) == 3
     assert "placeholder" in observations[1], "search_code 的命中必须回到模型手上"
     assert "def get_user_profile" in observations[2], "read_file 的正文必须回到模型手上"
-    # 工具定义每一轮都带上了，且是按名字排序的四个只读工具
-    assert all([item["function"]["name"] for item in tools] == TOOL_NAMES for tools in fake.tools)
+    # 工具定义每一轮都带上了，且是按名字排序的四个只读工具。
+    # 断言落在 ToolSpec 上而不是 {"type": "function", ...} 上：Agent Loop 交出去的
+    # 就是 ToolSpec，把它翻成 DeepSeek tools[] 是适配器的事。
+    assert all([spec.name for spec in tools] == TOOL_NAMES for tools in fake.tools)
+    assert all(isinstance(spec, ToolSpec) for tools in fake.tools for spec in tools), (
+        "Agent Loop 必须把 ToolSpec 原样交给客户端，而不是自己拼 wire format"
+    )
 
     # ---- 最终产出的 IntegrationPlan 来自 Agent 挑的端点 ----
     assert [item["endpoint"]["method"] for item in body["plan"]["endpoints"]] == [AGENT_ENDPOINT[0]]

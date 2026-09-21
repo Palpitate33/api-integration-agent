@@ -1,4 +1,4 @@
-"""DeepSeek LLM Client：通过 DeepSeek 官方 OpenAI 兼容 API 调用真实模型。
+"""DeepSeek Adapter：通过 DeepSeek 官方 OpenAI 兼容 API 调用真实模型。
 
 两个能力，互不影响：
 
@@ -8,12 +8,19 @@
                                      工具，但**绝不执行它们**。
 
 职责边界（与修复逻辑、与工具执行都完全解耦）：
-    prompt / messages → DeepSeek → raw text / 结构化的一轮。
+    provider-neutral 的输入（messages / ToolSpec）→ DeepSeek wire format → HTTP
+    → provider-neutral 的输出（AssistantTurn）。**provider schema 全部收敛在本模块**：
+
+        ToolSpec                → tools[] 的 {"type": "function", ...} 元素
+        ChatMessage.tool_calls  → messages[] 里的 {"type": "function", ...}
+        response_format / JSON mode / reasoning_content / finish_reason
+
+    上层（AgentLoop / Planner / Applier）只知道 ToolSpec 与 AssistantTurn，
+    不需要、也无法构造这些形状。
+
     不解析业务 JSON、不接触 RepairPlan / GeneratedArtifacts（那是 Applier 的职责）；
-    不认识 ToolRegistry，也不 import tools 包（tools 的 JSON Schema 由调用方
-    通过 agent.llm.tool_spec_to_deepseek_function 转好再传进来）。
-    chat() 的产物是「模型想做什么」，不是「做了什么」——工具的查找、权限判断、
-    参数校验与执行全部属于后续 Agent Loop。
+    不认识 ToolRegistry，也不认识工具的**执行**——ToolSpec 是纯数据声明，
+    本模块只读它的 name / description / parameters。
 
 安全边界：
     - API Key 只从环境变量 DEEPSEEK_API_KEY 读取（或显式构造传入），
@@ -26,12 +33,10 @@
     - 不依赖第三方 SDK：标准库 urllib 直接调用 OpenAI 兼容的
       POST {base_url}/chat/completions，零额外依赖。
 
-依赖方向说明：
-    本模块 import integration_agent.agent.llm 取消息与返回值的类型定义。
-    这是「具体 provider 实现依赖抽象契约」，方向是对的；且实测
-    ``import integration_agent.repair`` 本来就会经 repair → generation → agent
-    加载 agent 包，这条 import 没有引入新的可达性，也不成环（agent 在运行时
-    不依赖 repair，见 agent/deepseek_planner.py 的 TYPE_CHECKING 说明）。
+依赖方向：
+    llm → tools.models（纯数据契约）与 llm.models / llm.client（同层契约）。
+    本模块不依赖 agent / repair / pipeline / api_server：适配器是被上层依赖的
+    底层实现，方向单一。
 
 配置：
     DEEPSEEK_API_KEY   必需；缺失时抛 DeepSeekConfigError
@@ -41,6 +46,7 @@
     DEEPSEEK_BASE_URL  可选；默认 https://api.deepseek.com
 """
 
+import copy
 import json
 import os
 import urllib.error
@@ -50,7 +56,8 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from integration_agent.agent.llm import AssistantTurn, ChatMessage, ToolCallRequest
+from integration_agent.llm.models import AssistantTurn, ChatMessage, ToolCallRequest
+from integration_agent.tools.models import ToolSpec
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
@@ -86,8 +93,42 @@ class DeepSeekResponseError(DeepSeekLLMError):
     """响应为空、非 JSON 或缺少有效文本。"""
 
 
+def tool_spec_to_deepseek_function(spec: ToolSpec) -> dict[str, Any]:
+    """把 ToolSpec 转成 OpenAI / DeepSeek function calling 的 tools[] 元素。
+
+    只搬运 name / description / parameters 三样：
+
+    - read_only 是我们这边的策略标记（最终由 ToolRegistry 与调用方消费），
+      API 不认识它，传过去只是浪费 token，所以不传；
+    - ToolSpec 里既没有项目路径也没有凭据，转换结果天然不含敏感信息。
+
+    返回的是**新构造的普通 dict**：parameters 深拷贝，调用方改它不会污染
+    ToolSpec；两次调用结果逐键相等，可直接 json.dumps 进请求体。
+
+    这是 provider schema 的唯一定义处：调用方（AgentLoop / Planner）只交
+    ToolSpec，转换由 DeepSeekLLMClient.chat() 内部完成，不向外暴露这一步。
+    """
+    # 兜底补上 type / properties：ToolSpec 只保证 parameters 可 JSON 序列化、
+    # 且 type（若存在）为 object，而 API 侧期望一个完整可读的 object schema。
+    parameters = copy.deepcopy(dict(spec.parameters))
+    parameters.setdefault("type", "object")
+    parameters.setdefault("properties", {})
+    return {
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": parameters,
+        },
+    }
+
+
 class DeepSeekLLMClient:
-    """DeepSeek 真实客户端：实现 LLMClient Protocol，可注入 StructuredLLMRepairApplier。"""
+    """DeepSeek 真实客户端：同时实现 LLMClient 与 ToolCallingClient 两个协议。
+
+    可以把实例注入 StructuredLLMRepairApplier（只用 generate），也可以注入
+    ToolUsingPlanner / AgentLoopRunner（只用 chat）。
+    """
 
     def __init__(
         self,
@@ -126,7 +167,7 @@ class DeepSeekLLMClient:
         self,
         messages: Sequence[ChatMessage],
         *,
-        tools: Sequence[dict[str, Any]] | None = None,
+        tools: Sequence[ToolSpec] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         temperature: float | None = None,
@@ -134,9 +175,10 @@ class DeepSeekLLMClient:
     ) -> AssistantTurn:
         """多轮 + Tool Calling：把消息列表发给模型，返回结构化的一轮。
 
-        tools 是**已经转换好的** JSON Schema 列表（调用方用
-        agent.llm.tool_spec_to_deepseek_function(ToolSpec) 生成）。本方法不认识
-        ToolSpec、不认识 ToolRegistry —— 它只把 schema 塞进请求体。
+        tools 收的是 **ToolSpec**（provider-neutral 的工具声明）：调用方只需要
+        说清「有哪些工具」，ToolSpec → DeepSeek tools[] 的转换由本方法内部完成
+        （见 tool_spec_to_deepseek_function）。调用方不需要、也不应该知道
+        "type": "function" 这类 wire format。
 
         返回的 tool_calls 是模型的请求，**没有被执行**：本方法不会去查工具、
         不会调用工具、更不会访问 tool arguments 里提到的任何地址或路径。
@@ -162,7 +204,7 @@ class DeepSeekLLMClient:
         self,
         messages: Sequence[ChatMessage],
         *,
-        tools: Sequence[dict[str, Any]] | None,
+        tools: Sequence[ToolSpec] | None,
         tool_choice: str | dict[str, Any] | None,
         response_format: dict[str, Any] | None,
         temperature: float | None,
@@ -171,6 +213,9 @@ class DeepSeekLLMClient:
 
         只有 tools 非空时才带 tools / tool_choice：给一个空的 tools 数组与
         完全不带，语义并不相同，后者才是「本轮不提供工具」。
+
+        这里是 provider schema 的边界：ToolSpec 与 ChatMessage 在这一步才变成
+        DeepSeek 认识的形状，往上一层都拿不到这些 dict。
         """
         payload: dict[str, Any] = {
             "model": self.model,
@@ -178,7 +223,7 @@ class DeepSeekLLMClient:
             "temperature": self.temperature if temperature is None else temperature,
         }
         if tools:
-            payload["tools"] = [dict(tool) if isinstance(tool, dict) else tool for tool in tools]
+            payload["tools"] = [tool_spec_to_deepseek_function(spec) for spec in tools]
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
         if response_format is not None:
@@ -263,6 +308,10 @@ def _message_to_payload(message: ChatMessage) -> dict[str, Any]:
 
     reasoning_content 只在存在时下发：非推理模型根本没有这个字段，凭空补一个
     空串与「这一轮没有思维链」并不是一回事。值原样搬运，不重新编码。
+
+    tool_calls 的 {"type": "function", "function": {...}} 同样属于 provider
+    wire format，因此只在这一层出现：arguments 逐字节原样搬运（不解析再序列化），
+    否则下一轮 tool 消息会对不上号。
     """
     payload: dict[str, Any] = {"role": message.role, "content": message.content}
     if message.reasoning_content is not None:
@@ -357,7 +406,7 @@ def _coerce_arguments(value: Any) -> str:
 
     正常情况下 API 给的就是字符串。个别 OpenAI 兼容实现会给一个已经解析好的
     对象，这时重新序列化而不是报错——丢掉这个调用等于把模型的动作吞掉。
-    结果的 JSON 合法性由 agent.llm.parse_tool_arguments 判定，这里不预判。
+    结果的 JSON 合法性由 llm.models.parse_tool_arguments 判定，这里不预判。
     """
     if value is None:
         return ""
@@ -382,3 +431,15 @@ def _redact(text: str, secret: str) -> str:
     if secret:
         text = text.replace(secret, "***")
     return text
+
+
+__all__ = [
+    "DEFAULT_MODEL",
+    "DeepSeekAPIError",
+    "DeepSeekConfigError",
+    "DeepSeekLLMClient",
+    "DeepSeekLLMError",
+    "DeepSeekResponseError",
+    "DeepSeekTimeoutError",
+    "tool_spec_to_deepseek_function",
+]

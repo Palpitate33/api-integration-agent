@@ -35,17 +35,17 @@ import pytest
 
 from integration_agent.agent import tool_planner as tool_planner_module
 from integration_agent.agent.agent_loop import AgentLoopConfig, AgentLoopRunner, AgentRunResult
-from integration_agent.agent.llm import (
-    AssistantTurn,
-    ChatMessage,
-    FakeToolCallingClient,
-    ToolCallRequest,
-)
 from integration_agent.agent.models import IntegrationPlan
 from integration_agent.agent.planner import IntegrationPlanner, PlanningError
 from integration_agent.agent.state import PlannerState
 from integration_agent.agent.tool_planner import ToolUsingPlanner, parse_final_plan
 from integration_agent.api import parse_openapi_text
+from integration_agent.llm import (
+    AssistantTurn,
+    ChatMessage,
+    FakeToolCallingClient,
+    ToolCallRequest,
+)
 from integration_agent.repository import scan_repository
 from integration_agent.tools import ToolContext, ToolRegistry, ToolResult, ToolSpec
 
@@ -93,12 +93,12 @@ ALLOWED_PLANNER_IMPORTS = {
     "typing",
     "integration_agent.agent.agent_loop",
     "integration_agent.agent.deepseek_planner",
-    "integration_agent.agent.llm",
     "integration_agent.agent.models",
     "integration_agent.agent.planner",
     "integration_agent.agent.prompt",
     "integration_agent.agent.state",
     "integration_agent.agent.tool_prompt",
+    "integration_agent.llm",
     "integration_agent.tools",
     "integration_agent.tools.registry",
 }
@@ -573,8 +573,10 @@ def test_15_the_model_never_executes_tools_itself(state) -> None:
 
     plan = ToolUsingPlanner(client, registry=ToolRegistry([spy])).plan(state)
 
-    # 工具定义提供给了模型，但模型只回了一个最终回答 —— 什么都没被执行
-    assert [item["function"]["name"] for item in client.tools[0]] == ["spy"]
+    # 工具定义提供给了模型（ToolSpec 原样，wire format 由适配器负责），
+    # 但模型只回了一个最终回答 —— 什么都没被执行
+    assert [spec.name for spec in client.tools[0]] == ["spy"]
+    assert all(isinstance(spec, ToolSpec) for spec in client.tools[0])
     assert spy.invocations == []
     assert isinstance(plan, IntegrationPlan)
 

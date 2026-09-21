@@ -53,13 +53,13 @@ from integration_agent.agent.agent_loop import (
     AgentLoopConfig,
     AgentLoopRunner,
 )
-from integration_agent.agent.llm import (
+from integration_agent.api import APIEndpoint, APIInfo
+from integration_agent.llm import (
     AssistantTurn,
     ChatMessage,
     FakeToolCallingClient,
     ToolCallRequest,
 )
-from integration_agent.api import APIEndpoint, APIInfo
 from integration_agent.repository import scan_repository
 from integration_agent.tools import (
     ToolContext,
@@ -78,7 +78,7 @@ ALLOWED_LOOP_IMPORTS = {
     "logging",
     "typing",
     "pydantic",
-    "integration_agent.agent.llm",
+    "integration_agent.llm",
     "integration_agent.tools.models",
     "integration_agent.tools.registry",
 }
@@ -855,15 +855,26 @@ def test_tool_resources_are_not_in_the_context(tmp_path: Path) -> None:
         assert needle not in dumped.lower()
 
 
-def test_tool_schemas_sent_to_the_model_are_stable_and_credential_free(tmp_path: Path) -> None:
+def test_tools_sent_to_the_model_are_tool_specs_not_wire_format(tmp_path: Path) -> None:
+    """回路交给客户端的是 provider-neutral 的 ToolSpec。
+
+    这里刻意**不**断言 `tools[0]["function"]["name"]`：那是 DeepSeek 的 wire
+    format，构造它是适配器（llm/deepseek.py）的职责。回路一旦自己拼出
+    {"type": "function", ...}，这层抽象就等于没有——所以断言落在"它是不是
+    ToolSpec"上，而不是落在某一种 provider JSON 的形状上。
+    """
     spy = _SpyTool("spy")
     client = FakeToolCallingClient(_final_turn())
 
     _run(client, context=_context(tmp_path), registry=_registry(spy))
 
     sent_tools = client.tools[0]
-    assert [item["function"]["name"] for item in sent_tools] == ["spy"]
-    rendered = json.dumps(sent_tools, ensure_ascii=False, sort_keys=True)
+    assert [spec.name for spec in sent_tools] == ["spy"]
+    assert all(isinstance(spec, ToolSpec) for spec in sent_tools)
+    # ToolSpec 里没有 "function" 这层包装键：转换还没有发生
+    assert all("function" not in spec.model_dump() for spec in sent_tools)
+
+    rendered = json.dumps([spec.model_dump() for spec in sent_tools], ensure_ascii=False)
     for needle in CREDENTIAL_NEEDLES:
         assert needle not in rendered.lower()
     assert str(tmp_path) not in rendered  # 绝不把本机绝对路径写进工具定义

@@ -27,7 +27,7 @@ import re
 from typing import Protocol, runtime_checkable
 
 from integration_agent.generation import GeneratedArtifacts, GeneratedFile
-from integration_agent.repair.llm_client import LLMClient
+from integration_agent.llm import LLMClient
 from integration_agent.repair.models import (
     LLMFileChange,
     LLMRepairResponse,

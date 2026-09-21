@@ -1,6 +1,6 @@
 """DeepSeekLLMClient 单元测试（全部离线，禁止真实网络请求）。
 
-通过替换 deepseek_client._http_post 模拟 HTTP 层，覆盖要求场景：
+通过替换 deepseek._http_post 模拟 HTTP 层，覆盖要求场景：
     1. API Key 从环境变量读取    2. 显式 api_key 覆盖环境变量
     3. 缺少 API Key              4. model 配置
     5. base_url 配置             6. prompt 正确传给 client
@@ -32,26 +32,32 @@ from typing import Any
 
 import pytest
 
-from integration_agent import repair
-from integration_agent.agent.llm import (
+from integration_agent import llm
+from integration_agent.llm import (
     AssistantTurn,
     ChatMessage,
     FakeToolCallingClient,
     ToolCallingClient,
     ToolCallRequest,
+    deepseek,
     tool_spec_to_deepseek_function,
 )
-from integration_agent.repair import deepseek_client
 from integration_agent.tools import build_default_registry
 
 DEFAULT_BODY = json.dumps({"choices": [{"message": {"content": "你好世界"}}]})
 
 SECRET = "sk-super-secret-123"
 
-# repair/deepseek_client.py 允许 import 的全部模块。白名单而非黑名单：新增
-# import 必须是有意识的决定。特别地，这里没有 integration_agent.tools ——
-# chat() 只搬运 JSON Schema，不认识 ToolRegistry，也不执行任何工具。
+# llm/deepseek.py 允许 import 的全部模块。白名单而非黑名单：新增
+# import 必须是有意识的决定。
+#
+# 这里**允许** integration_agent.tools.models：chat() 收到的 tools 是
+# provider-neutral 的 ToolSpec，适配器必须认识这个纯数据契约，才能把它转成
+# DeepSeek 的 tools[]。**不允许**的是 integration_agent.tools（包级，
+# registry / 具体工具都在里面）、tools.registry 与任何 agent 模块——
+# 适配器不认识 ToolRegistry、不认识 AgentLoop，更没有任何执行工具的入口。
 ALLOWED_CLIENT_IMPORTS = {
+    "copy",
     "json",
     "os",
     "urllib.error",
@@ -59,7 +65,8 @@ ALLOWED_CLIENT_IMPORTS = {
     "collections.abc",
     "typing",
     "pydantic",
-    "integration_agent.agent.llm",
+    "integration_agent.llm.models",
+    "integration_agent.tools.models",
 }
 
 
@@ -123,7 +130,7 @@ def no_real_network(monkeypatch) -> None:
     def bomb(*args, **kwargs):
         raise AssertionError("单元测试不允许真实网络请求：请用 _patch_http 打桩")
 
-    monkeypatch.setattr(deepseek_client.urllib.request, "urlopen", bomb)
+    monkeypatch.setattr(deepseek.urllib.request, "urlopen", bomb)
 
 
 def _patch_http(
@@ -141,11 +148,11 @@ def _patch_http(
             raise error
         return status, body
 
-    monkeypatch.setattr(deepseek_client, "_http_post", fake_post)
+    monkeypatch.setattr(deepseek, "_http_post", fake_post)
 
 
-def _client(**kwargs) -> repair.DeepSeekLLMClient:
-    return repair.DeepSeekLLMClient(api_key="test-key", **kwargs)
+def _client(**kwargs) -> llm.DeepSeekLLMClient:
+    return llm.DeepSeekLLMClient(api_key="test-key", **kwargs)
 
 
 # ----------------------------------------- 场景 1-2：API Key 读取
@@ -156,7 +163,7 @@ def test_api_key_from_environment(monkeypatch, no_env_key) -> None:
     sink: dict[str, Any] = {}
     _patch_http(monkeypatch, sink=sink)
 
-    client = repair.DeepSeekLLMClient()
+    client = llm.DeepSeekLLMClient()
     assert client.api_key == "env-key"
     assert client.generate("hi") == "你好世界"
     assert sink["headers"]["Authorization"] == "Bearer env-key"
@@ -164,7 +171,7 @@ def test_api_key_from_environment(monkeypatch, no_env_key) -> None:
 
 def test_explicit_api_key_overrides_environment(monkeypatch, no_env_key) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-key")
-    client = repair.DeepSeekLLMClient(api_key="explicit-key")
+    client = llm.DeepSeekLLMClient(api_key="explicit-key")
     assert client.api_key == "explicit-key"
 
 
@@ -172,8 +179,8 @@ def test_explicit_api_key_overrides_environment(monkeypatch, no_env_key) -> None
 
 
 def test_missing_api_key_raises_config_error(no_env_key) -> None:
-    with pytest.raises(repair.DeepSeekConfigError, match="DEEPSEEK_API_KEY"):
-        repair.DeepSeekLLMClient()
+    with pytest.raises(llm.DeepSeekConfigError, match="DEEPSEEK_API_KEY"):
+        llm.DeepSeekLLMClient()
 
 
 # ----------------------------------------------- 场景 4-5：model / base_url
@@ -239,7 +246,7 @@ def test_normal_response_returns_text(monkeypatch, no_env_key) -> None:
 
 def test_empty_response_raises(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, body="")
-    with pytest.raises(repair.DeepSeekResponseError, match="空响应"):
+    with pytest.raises(llm.DeepSeekResponseError, match="空响应"):
         _client().generate("hi")
 
 
@@ -253,7 +260,7 @@ def test_error_status_codes_raise_api_error(monkeypatch, no_env_key, status: int
         status=status,
         body=json.dumps({"error": {"message": "server rejected"}}),
     )
-    with pytest.raises(repair.DeepSeekAPIError) as excinfo:
+    with pytest.raises(llm.DeepSeekAPIError) as excinfo:
         _client().generate("hi")
     assert excinfo.value.status == status
     assert "server rejected" in str(excinfo.value)
@@ -266,7 +273,7 @@ def test_http_error_exception_branch(monkeypatch, no_env_key) -> None:
         "https://api.deepseek.com/chat/completions", 401, "Unauthorized", {}, io.BytesIO(body)
     )
     _patch_http(monkeypatch, error=http_error)
-    with pytest.raises(repair.DeepSeekAPIError) as excinfo:
+    with pytest.raises(llm.DeepSeekAPIError) as excinfo:
         _client().generate("hi")
     assert excinfo.value.status == 401
     assert "invalid key" in str(excinfo.value)
@@ -277,7 +284,7 @@ def test_http_error_exception_branch(monkeypatch, no_env_key) -> None:
 
 def test_timeout_raises(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, error=TimeoutError("timed out"))
-    with pytest.raises(repair.DeepSeekTimeoutError, match="超时"):
+    with pytest.raises(llm.DeepSeekTimeoutError, match="超时"):
         _client().generate("hi")
 
 
@@ -286,7 +293,7 @@ def test_timeout_raises(monkeypatch, no_env_key) -> None:
 
 def test_network_failure_raises(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, error=urllib.error.URLError("connection refused"))
-    with pytest.raises(repair.DeepSeekLLMError, match="网络连接失败"):
+    with pytest.raises(llm.DeepSeekLLMError, match="网络连接失败"):
         _client().generate("hi")
 
 
@@ -300,19 +307,19 @@ def test_api_key_never_leaks_into_errors(monkeypatch, no_env_key) -> None:
         status=401,
         body=json.dumps({"error": {"message": f"bad token {secret} for your account"}}),
     )
-    with pytest.raises(repair.DeepSeekAPIError) as excinfo:
-        repair.DeepSeekLLMClient(api_key=secret).generate("hi")
+    with pytest.raises(llm.DeepSeekAPIError) as excinfo:
+        llm.DeepSeekLLMClient(api_key=secret).generate("hi")
     assert secret not in str(excinfo.value)
     assert "***" in str(excinfo.value)
 
 
 def test_missing_content_raises(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, body=json.dumps({"choices": []}))
-    with pytest.raises(repair.DeepSeekResponseError, match="choices"):
+    with pytest.raises(llm.DeepSeekResponseError, match="choices"):
         _client().generate("hi")
 
     _patch_http(monkeypatch, body=json.dumps({"choices": [{"message": {"content": ""}}]}))
-    with pytest.raises(repair.DeepSeekResponseError, match="有效文本"):
+    with pytest.raises(llm.DeepSeekResponseError, match="有效文本"):
         _client().generate("hi")
 
 
@@ -320,7 +327,7 @@ def test_missing_content_raises(monkeypatch, no_env_key) -> None:
 
 
 def test_llm_client_protocol_conformance(no_env_key) -> None:
-    assert isinstance(_client(), repair.LLMClient)
+    assert isinstance(_client(), llm.LLMClient)
 
 
 # ===========================================================================
@@ -407,7 +414,7 @@ def test_chat_omits_fields_that_belong_to_other_roles(monkeypatch, no_env_key) -
 
 
 def test_chat_rejects_an_empty_message_list(no_env_key) -> None:
-    with pytest.raises(repair.DeepSeekLLMError, match="messages 不能为空"):
+    with pytest.raises(llm.DeepSeekLLMError, match="messages 不能为空"):
         _client().chat([])
 
 
@@ -486,7 +493,7 @@ def test_chat_treats_a_content_only_reply_as_a_normal_turn(monkeypatch, no_env_k
 def test_chat_rejects_a_turn_with_neither_content_nor_tool_calls(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, body=_chat_body(content="   "))
 
-    with pytest.raises(repair.DeepSeekResponseError, match="既没有文本内容也没有 tool_calls"):
+    with pytest.raises(llm.DeepSeekResponseError, match="既没有文本内容也没有 tool_calls"):
         _client().chat(_user())
 
 
@@ -696,10 +703,10 @@ def test_chat_does_not_place_non_serializable_arguments_in_the_turn() -> None:
     直接对 _coerce_arguments 下单测：json.loads 只会产出 JSON 原生类型，
     所以这条分支走不到「从 HTTP 响应进来」的路径上，只能单独验证。
     """
-    with pytest.raises(repair.DeepSeekResponseError, match="tool arguments"):
-        deepseek_client._coerce_arguments(object())
+    with pytest.raises(llm.DeepSeekResponseError, match="tool arguments"):
+        deepseek._coerce_arguments(object())
 
-    assert deepseek_client._coerce_arguments(None) == ""
+    assert deepseek._coerce_arguments(None) == ""
 
 
 def test_chat_accepts_arguments_that_are_not_valid_json(monkeypatch, no_env_key) -> None:
@@ -746,7 +753,7 @@ def test_chat_rejects_malformed_tool_calls(
     """
     _patch_http(monkeypatch, body=_chat_body(tool_calls=tool_calls, finish_reason="tool_calls"))
 
-    with pytest.raises(repair.DeepSeekResponseError, match=expected):
+    with pytest.raises(llm.DeepSeekResponseError, match=expected):
         _client().chat(_user())
 
 
@@ -759,35 +766,40 @@ def test_chat_returns_no_tool_calls_when_the_field_is_absent(monkeypatch, no_env
 def test_chat_rejects_a_null_message(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, body=json.dumps({"choices": [{"message": None}]}))
 
-    with pytest.raises(repair.DeepSeekResponseError, match="message"):
+    with pytest.raises(llm.DeepSeekResponseError, match="message"):
         _client().chat(_user())
 
 
 def test_chat_rejects_a_non_json_response(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, body="<html>502 Bad Gateway</html>")
 
-    with pytest.raises(repair.DeepSeekResponseError, match="不是有效 JSON"):
+    with pytest.raises(llm.DeepSeekResponseError, match="不是有效 JSON"):
         _client().chat(_user())
 
 
 def test_chat_rejects_an_empty_response(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, body="")
 
-    with pytest.raises(repair.DeepSeekResponseError, match="空响应"):
+    with pytest.raises(llm.DeepSeekResponseError, match="空响应"):
         _client().chat(_user())
 
 
 # ------------------------------------- 场景 J：tools / tool_choice 进入请求体
 
 
-def test_chat_sends_tools_and_tool_choice(monkeypatch, no_env_key) -> None:
+def test_chat_converts_tool_specs_into_deepseek_tools(monkeypatch, no_env_key) -> None:
+    """适配器负责 ToolSpec → DeepSeek tools[]：调用方只交 ToolSpec。
+
+    断言的是**最终 payload**：转换位置从调用方搬进了适配器，请求体本身必须与
+    旧版本逐键一致（同样的 {"type": "function", "function": {...}} 形状）。
+    """
     sink: dict[str, Any] = {}
     _patch_http(monkeypatch, body=_chat_body(content="好"), sink=sink)
-    tools = [tool_spec_to_deepseek_function(spec) for spec in build_default_registry().specs()]
+    specs = build_default_registry().specs()
 
-    _client().chat(_user(), tools=tools, tool_choice="auto")
+    _client().chat(_user(), tools=specs, tool_choice="auto")
 
-    assert sink["payload"]["tools"] == tools
+    assert sink["payload"]["tools"] == [tool_spec_to_deepseek_function(spec) for spec in specs]
     assert [tool["function"]["name"] for tool in sink["payload"]["tools"]] == [
         "inspect_api",
         "inspect_project",
@@ -804,7 +816,7 @@ def test_chat_sends_named_tool_choice(monkeypatch, no_env_key) -> None:
 
     _client().chat(
         _user(),
-        tools=[tool_spec_to_deepseek_function(build_default_registry().specs()[0])],
+        tools=[build_default_registry().specs()[0]],
         tool_choice={"type": "function", "function": {"name": "inspect_api"}},
     )
 
@@ -834,10 +846,7 @@ def test_chat_only_sends_real_tool_schemas(monkeypatch, no_env_key) -> None:
     sink: dict[str, Any] = {}
     _patch_http(monkeypatch, body=_chat_body(content="好"), sink=sink)
 
-    _client().chat(
-        _user(),
-        tools=[tool_spec_to_deepseek_function(spec) for spec in build_default_registry().specs()],
-    )
+    _client().chat(_user(), tools=build_default_registry().specs())
 
     dumped = json.dumps(sink["payload"]["tools"], ensure_ascii=False)
     assert "read_only" not in dumped
@@ -845,15 +854,19 @@ def test_chat_only_sends_real_tool_schemas(monkeypatch, no_env_key) -> None:
         assert needle not in dumped.lower()
 
 
-def test_chat_does_not_mutate_the_caller_s_tools(monkeypatch, no_env_key) -> None:
+def test_chat_does_not_mutate_the_caller_s_tool_specs(monkeypatch, no_env_key) -> None:
     sink: dict[str, Any] = {}
     _patch_http(monkeypatch, body=_chat_body(content="好"), sink=sink)
-    tools = [tool_spec_to_deepseek_function(spec) for spec in build_default_registry().specs()]
-    before = json.dumps(tools, ensure_ascii=False)
+    specs = build_default_registry().specs()
+    before = json.dumps([spec.model_dump() for spec in specs], ensure_ascii=False, sort_keys=True)
 
-    _client().chat(_user(), tools=tools)
+    _client().chat(_user(), tools=specs)
 
-    assert json.dumps(tools, ensure_ascii=False) == before
+    # 转换会深拷贝 parameters：适配器改不到调用方手里的 ToolSpec
+    assert (
+        json.dumps([spec.model_dump() for spec in specs], ensure_ascii=False, sort_keys=True)
+        == before
+    )
 
 
 # ------------------------------------------- temperature / timeout / json_mode
@@ -923,8 +936,8 @@ def test_chat_api_key_never_leaks_into_errors(monkeypatch, no_env_key) -> None:
         body=json.dumps({"error": {"message": f"bad token {SECRET} for your account"}}),
     )
 
-    with pytest.raises(repair.DeepSeekAPIError) as excinfo:
-        repair.DeepSeekLLMClient(api_key=SECRET).chat(_user())
+    with pytest.raises(llm.DeepSeekAPIError) as excinfo:
+        llm.DeepSeekLLMClient(api_key=SECRET).chat(_user())
 
     assert SECRET not in str(excinfo.value)
     assert "***" in str(excinfo.value)
@@ -942,7 +955,7 @@ def test_chat_api_key_never_leaks_into_the_returned_turn(monkeypatch, no_env_key
         ),
     )
 
-    turn = repair.DeepSeekLLMClient(api_key=SECRET).chat(_user())
+    turn = llm.DeepSeekLLMClient(api_key=SECRET).chat(_user())
     dumped = json.dumps(turn.model_dump(), ensure_ascii=False)
 
     assert SECRET not in dumped
@@ -958,8 +971,8 @@ def test_chat_api_key_never_leaks_into_the_request_log_of_a_failure(
     """连接失败时只有异常类型名，不带 URL / header / Key。"""
     _patch_http(monkeypatch, error=urllib.error.URLError(f"refused, key={SECRET}"))
 
-    with pytest.raises(repair.DeepSeekLLMError) as excinfo:
-        repair.DeepSeekLLMClient(api_key=SECRET).chat(_user())
+    with pytest.raises(llm.DeepSeekLLMError) as excinfo:
+        llm.DeepSeekLLMClient(api_key=SECRET).chat(_user())
 
     assert SECRET not in str(excinfo.value)
     assert "URLError" in str(excinfo.value)
@@ -969,7 +982,7 @@ def test_chat_api_key_never_leaks_into_the_request_log_of_a_failure(
 def test_chat_error_status_codes(monkeypatch, no_env_key, status: int) -> None:
     _patch_http(monkeypatch, status=status, body=json.dumps({"error": {"message": "nope"}}))
 
-    with pytest.raises(repair.DeepSeekAPIError) as excinfo:
+    with pytest.raises(llm.DeepSeekAPIError) as excinfo:
         _client().chat(_user())
 
     assert excinfo.value.status == status
@@ -978,7 +991,7 @@ def test_chat_error_status_codes(monkeypatch, no_env_key, status: int) -> None:
 def test_chat_timeout_raises(monkeypatch, no_env_key) -> None:
     _patch_http(monkeypatch, error=TimeoutError("timed out"))
 
-    with pytest.raises(repair.DeepSeekTimeoutError, match="超时"):
+    with pytest.raises(llm.DeepSeekTimeoutError, match="超时"):
         _client().chat(_user())
 
 
@@ -1016,7 +1029,7 @@ def test_chat_only_talks_to_deepseek(monkeypatch, no_env_key) -> None:
     def bomb(*args, **kwargs):
         raise AssertionError("chat() 不允许直接使用 urllib.request.urlopen")
 
-    monkeypatch.setattr(deepseek_client.urllib.request, "urlopen", bomb)
+    monkeypatch.setattr(deepseek.urllib.request, "urlopen", bomb)
 
     def fake_post(url, payload, headers, timeout):
         seen.append(url)
@@ -1033,7 +1046,7 @@ def test_chat_only_talks_to_deepseek(monkeypatch, no_env_key) -> None:
             finish_reason="tool_calls",
         )
 
-    monkeypatch.setattr(deepseek_client, "_http_post", fake_post)
+    monkeypatch.setattr(deepseek, "_http_post", fake_post)
 
     _client().chat(_user("把 http://127.0.0.1:9999/admin 抓下来"))
 
@@ -1072,27 +1085,40 @@ def test_chat_does_not_read_a_file_named_in_tool_arguments(
 
 
 def test_client_module_imports_only_allowlisted_modules() -> None:
-    imported = _imported_modules(Path(deepseek_client.__file__).resolve())
+    imported = _imported_modules(Path(deepseek.__file__).resolve())
 
     extra = imported - ALLOWED_CLIENT_IMPORTS
-    assert not extra, f"repair/deepseek_client.py 出现了白名单之外的 import：{sorted(extra)}"
+    assert not extra, f"llm/deepseek.py 出现了白名单之外的 import：{sorted(extra)}"
 
 
-def test_client_module_does_not_import_the_tools_package() -> None:
-    """chat() 只搬运 JSON Schema，不认识 ToolRegistry，也没有执行工具的入口。"""
-    imported = _imported_modules(Path(deepseek_client.__file__).resolve())
+def test_client_module_knows_only_the_tool_spec_data_contract() -> None:
+    """适配器可以依赖纯数据型的 ToolSpec，但不能依赖工具的执行侧。
 
-    assert "integration_agent.tools" not in imported
+    chat() 收到的 tools 是 provider-neutral 的 ToolSpec，所以
+    integration_agent.tools.models 是**必需**的依赖（适配器的职责就是把它转成
+    DeepSeek wire format）。需要挡住的是另一半：ToolRegistry（工具的查找与执行
+    入口）、AgentLoop / ToolUsingPlanner（调用方）——适配器一旦认识它们，
+    "谁负责转 schema" 这条边界就又糊回去了。
+    """
+    imported = _imported_modules(Path(deepseek.__file__).resolve())
+
+    assert "integration_agent.tools.models" in imported  # 转换的输入类型
+    assert "integration_agent.tools" not in imported  # 包级：会带出 registry 与具体工具
     assert "integration_agent.tools.registry" not in imported
+    assert "integration_agent.agent.agent_loop" not in imported
+    assert "integration_agent.agent.tool_planner" not in imported
     for module in imported:
-        assert not module.startswith("integration_agent.tools."), module
+        if module.startswith("integration_agent.tools."):
+            assert module == "integration_agent.tools.models", module
+        assert not module.startswith("integration_agent.agent."), module
+        assert not module.startswith("integration_agent.repair."), module
 
 
 def test_client_module_has_no_execution_capability() -> None:
-    imported = _imported_modules(Path(deepseek_client.__file__).resolve())
+    imported = _imported_modules(Path(deepseek.__file__).resolve())
 
     for forbidden in ("subprocess", "socket", "shutil", "pathlib", "tempfile", "importlib"):
-        assert forbidden not in imported, f"repair/deepseek_client.py 引入了能力模块 {forbidden}"
+        assert forbidden not in imported, f"llm/deepseek.py 引入了能力模块 {forbidden}"
 
 
 # -------------------------------------------------- 场景 15：ToolCallingClient

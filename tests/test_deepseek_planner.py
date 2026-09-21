@@ -50,7 +50,7 @@ from integration_agent.agent.prompt import (
     build_planner_prompt,
 )
 from integration_agent.api import parse_openapi_text
-from integration_agent.repair import FakeLLMClient
+from integration_agent.llm import FakeLLMClient
 from integration_agent.repository import CodeMatch, ProjectStructure, SearchResult, scan_repository
 
 # ---------------------------------------------------------------- Fixtures

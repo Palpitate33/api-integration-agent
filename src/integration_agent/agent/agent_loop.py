@@ -25,7 +25,10 @@
       错误数各有上限，循环是明确的 for 而不是 while True。
 
 依赖方向：
-    agent → tools → api / repository。本模块不反向依赖 repair / pipeline / api_server。
+    agent → llm（provider-neutral 契约）→ tools.models；agent → tools → api / repository。
+    本模块不反向依赖 repair / pipeline / api_server，也不依赖 llm 包里的任何
+    适配器：它只认识 ToolSpec / ToolCallRequest / AssistantTurn / ToolCallingClient，
+    不生成也不解析任何 provider wire format。
 """
 
 import hashlib
@@ -35,12 +38,11 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
 
-from integration_agent.agent.llm import (
+from integration_agent.llm import (
     ChatMessage,
     ToolCallingClient,
     ToolCallRequest,
     parse_tool_arguments,
-    tool_spec_to_deepseek_function,
 )
 from integration_agent.tools.models import ToolResult
 from integration_agent.tools.registry import AgentTool, ToolContext, ToolRegistry
@@ -177,8 +179,10 @@ class AgentLoopRunner:
             ChatMessage(role="user", content=user_prompt),
         ]
         history_chars = len(system_prompt) + len(user_prompt)
-        # 顺序取 registry.specs()（按名字排序），保证同样输入产生同样的 tools 定义
-        tools = [tool_spec_to_deepseek_function(spec) for spec in registry.specs()]
+        # 顺序取 registry.specs()（按名字排序），保证同样输入产生同样的 tools 定义。
+        # 原样把 ToolSpec 交给客户端：ToolSpec → provider wire format 的转换是
+        # 适配器的职责，本模块不认识也不需要认识任何 provider 的请求体形状。
+        tools = registry.specs()
 
         calls: list[ToolCallRequest] = []
         results: list[ToolResult] = []

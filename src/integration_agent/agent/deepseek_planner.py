@@ -22,19 +22,19 @@ LLM 负责**判断**：集成目标、策略取舍、要新建/修改哪些文�
     - 不自行全仓库扫描：只在调用方未提供证据时，通过 repository.code_search
       发起少量**受限**定向检索（有 max_results / max_total_chars 上限）。
 
-为什么 LLMClient 的类型来自 TYPE_CHECKING
------------------------------------------
-``repair`` 包依赖 ``generation``，而 ``generation`` 依赖 ``agent``。若在运行时
-import ``integration_agent.repair.llm_client``，就会在 ``agent/__init__`` 导入本模块时
-形成环。LLMClient 本身只是 ``generate(prompt) -> str`` 的结构化协议，因此这里在类型
-层面引用、运行时按鸭子类型校验，依赖方向保持 ``agent`` 不依赖 ``repair``。
+LLMClient 从哪来
+----------------
+``LLMClient`` 是 provider-neutral 的最小契约（``generate(prompt) -> str``），
+归属 ``integration_agent.llm`` —— 既不属 repair，也不属 agent，因此这里是
+一个普通的运行时 import，不再需要绕开 import cycle 的 TYPE_CHECKING 变通：
+``agent → llm`` 是单向的，``llm`` 不依赖任何一个 domain 包。
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from integration_agent.agent.models import (
     AuthenticationPlan,
@@ -49,10 +49,8 @@ from integration_agent.agent.planner import DEFAULT_MAX_ENDPOINTS, KNOWN_HTTP_CL
 from integration_agent.agent.prompt import DEFAULT_MAX_PROMPT_CHARS, build_planner_prompt
 from integration_agent.agent.state import PlannerState
 from integration_agent.api import APIEndpoint, APIInfo
+from integration_agent.llm import LLMClient
 from integration_agent.repository import search_code
-
-if TYPE_CHECKING:  # 仅用于类型标注；运行时按结构化协议校验（见模块 docstring）
-    from integration_agent.repair.llm_client import LLMClient
 
 # ------------------------------------------------------------------ 常量
 

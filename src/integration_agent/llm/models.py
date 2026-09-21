@@ -1,18 +1,18 @@
-"""支持多轮消息与 Tool Calling 的 LLM 客户端抽象。
+"""Provider-neutral 的 LLM 数据模型：消息、一轮响应、工具调用请求。
 
-这一层只描述「发消息 → 收模型响应」，不描述「谁来执行工具」：
+这一层只描述「消息长什么样」「模型返回的一轮长什么样」，不描述「谁来执行工具」，
+也不认识任何具体 provider：
 
-    ToolCallingClient.chat(messages, tools=...) -> AssistantTurn
-        messages  —— 结构化的 ChatMessage 列表（system / user / assistant / tool）
-        tools     —— function calling 的 JSON Schema 列表，由
-                     tool_spec_to_deepseek_function(ToolSpec) 转换而来
-        返回值    —— AssistantTurn；其中的 tool_calls 是**模型的请求**，
-                     不是执行结果，也不是执行许可
+    ChatMessage       —— 结构化的对话消息（system / user / assistant / tool）
+    AssistantTurn     —— 模型返回的一轮；其中的 tool_calls 是**模型的请求**，
+                         不是执行结果，也不是执行许可
+    ToolCallRequest   —— 一次工具调用请求；arguments 保持原始 JSON 字符串
+    ToolArguments     —— arguments 的解析结果（永不抛异常）
 
 职责边界：
-    本模块不 import ToolRegistry、不 import 任何具体 provider 客户端、不联网。
-    工具的执行属于后续 Agent Loop 的职责：这里只把模型的意图变成结构化对象，
-    让「要不要执行、执行结果怎么回填」成为一个显式的、可审阅的决定。
+    本模块不 import ToolRegistry、不 import 任何 provider 客户端、不联网、
+    不读环境变量。工具的执行属于 Agent Loop 的职责：这里只把模型的意图变成
+    结构化对象，让「要不要执行、执行结果怎么回填」成为显式的、可审阅的决定。
 
 安全边界：
     - 这些模型里没有、也不允许出现 API Key / base_url / 环境变量的位置。
@@ -24,19 +24,20 @@
       坏 JSON 是可恢复的状况，应该把错误回给模型让它重试，而不是让整轮对话炸掉。
 
 与 LLMClient 的关系：
-    LLMClient.generate(prompt) -> str 是 Repair 流程在用的最小接口，保持不变。
-    ToolCallingClient 是它的多轮版本：消息进、结构化的一轮出，二者互不影响，
-    具体客户端（如 DeepSeekLLMClient）可以同时实现两者。
+    LLMClient.generate(prompt) -> str 是 Repair 流程在用的最小接口（见 client.py），
+    本模块与它无关。ToolCallingClient 是它的多轮版本：消息进、结构化的一轮出，
+    二者互不影响，同一个客户端可以同时实现两者。
+
+provider-neutral 的字面含义：
+    本模块**不出现任何 provider 的名字**。不是"顺便没写"，而是由
+    tests/test_llm_architecture.py 逐标识符检查——模型里一旦冒出某个厂商的
+    专有字段，这里就不再是"所有 provider 都能用的消息模型"了。
 """
 
-import copy
 import json
-from collections.abc import Sequence
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
-
-from integration_agent.tools.models import ToolSpec
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
 
@@ -192,111 +193,11 @@ class AssistantTurn(BaseModel):
         )
 
 
-@runtime_checkable
-class ToolCallingClient(Protocol):
-    """多轮 + Tool Calling 的 LLM 客户端契约。
-
-    只约束最小的公共面：消息进、一轮出。temperature / timeout / response_format
-    这类 provider 参数不放进协议——它们是具体客户端的旋钮，不属于调用方必须
-    知道的东西。
-    """
-
-    def chat(
-        self,
-        messages: Sequence[ChatMessage],
-        *,
-        tools: Sequence[dict[str, Any]] | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-    ) -> AssistantTurn:
-        """把消息列表发给模型，返回结构化的一轮回复。"""
-        ...
-
-
-def tool_spec_to_deepseek_function(spec: ToolSpec) -> dict[str, Any]:
-    """把 ToolSpec 转成 OpenAI / DeepSeek function calling 的 tools[] 元素。
-
-    只搬运 name / description / parameters 三样：
-
-    - read_only 是我们这边的策略标记（最终由 ToolRegistry 与调用方消费），
-      API 不认识它，传过去只是浪费 token，所以不传；
-    - ToolSpec 里既没有项目路径也没有凭据，转换结果天然不含敏感信息。
-
-    返回的是**新构造的普通 dict**：parameters 深拷贝，调用方改它不会污染
-    ToolSpec；两次调用结果逐键相等，可直接 json.dumps 进请求体。
-    """
-    # 兜底补上 type / properties：ToolSpec 只保证 parameters 可 JSON 序列化、
-    # 且 type（若存在）为 object，而 API 侧期望一个完整可读的 object schema。
-    parameters = copy.deepcopy(dict(spec.parameters))
-    parameters.setdefault("type", "object")
-    parameters.setdefault("properties", {})
-    return {
-        "type": "function",
-        "function": {
-            "name": spec.name,
-            "description": spec.description,
-            "parameters": parameters,
-        },
-    }
-
-
-class FakeToolCallingClient:
-    """按队列返回预设 AssistantTurn 的假客户端：确定性、不联网、不需要 API Key。
-
-    主要用途是让后续 Agent Loop 能在离线状态下测完整回路：
-
-        fake = FakeToolCallingClient([
-            AssistantTurn(tool_calls=[ToolCallRequest(
-                id="call-1", name="search_code", arguments='{"query": "httpx"}')]),
-            AssistantTurn(content="完成", finish_reason="stop"),
-        ])
-        fake.chat(messages)   # -> 带 tool_calls 的一轮
-        fake.chat(messages)   # -> 最终文本
-
-    两种模式，由**传入的形式**决定，而不是由剩余个数决定：
-
-        传单个 AssistantTurn  -> 每次都返回它（固定回答，永不耗尽）
-        传列表                -> 严格按顺序弹出，用完后抛 AssertionError
-
-    这里刻意与 FakeLLMClient 判然有别。FakeLLMClient 用「剩余个数 == 1」判断是否
-    重复，结果是**传两个响应时第二个会被无限重复**，「调用次数超过预期」永远不会
-    触发；一个多跑了一轮的 Agent Loop 会静默通过。假客户端存在的意义就是让这种
-    问题炸出来，所以这里改成按传入形式判定：列表就必须恰好消耗完。
-
-    requests / tools 记录每次调用的入参，供断言「消息与工具定义确实传对了」。
-    """
-
-    def __init__(self, turns: AssistantTurn | list[AssistantTurn] = ()) -> None:
-        self._repeat = isinstance(turns, AssistantTurn)
-        self._turns = [turns] if self._repeat else list(turns)
-        self.calls = 0
-        self.requests: list[list[ChatMessage]] = []
-        self.tools: list[list[dict[str, Any]]] = []
-
-    def chat(
-        self,
-        messages: Sequence[ChatMessage],
-        *,
-        tools: Sequence[dict[str, Any]] | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-    ) -> AssistantTurn:
-        self.calls += 1
-        self.requests.append(list(messages))
-        self.tools.append(list(tools) if tools else [])
-        if not self._turns:
-            raise AssertionError("FakeToolCallingClient 被调用的次数超过预期")
-        if self._repeat:
-            return self._turns[0]
-        return self._turns.pop(0)
-
-
 __all__ = [
     "AssistantTurn",
     "ChatMessage",
     "ChatRole",
-    "FakeToolCallingClient",
     "ToolArguments",
     "ToolCallRequest",
-    "ToolCallingClient",
     "parse_tool_arguments",
-    "tool_spec_to_deepseek_function",
 ]

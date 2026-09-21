@@ -32,12 +32,9 @@ from integration_agent.agent import DeepSeekPlanner, ToolUsingPlanner
 from integration_agent.api_server.demo import DEMO_ONLY_MESSAGE, SabotagedGenerator, is_demo_target
 from integration_agent.api_server.models import IntegrationRunRequest
 from integration_agent.api_server.paths import resolve_allowed
+from integration_agent.llm import DeepSeekConfigError, DeepSeekLLMClient
 from integration_agent.pipeline import PipelineResult, run_pipeline
-from integration_agent.repair import (
-    DeepSeekConfigError,
-    DeepSeekLLMClient,
-    StructuredLLMRepairApplier,
-)
+from integration_agent.repair import StructuredLLMRepairApplier
 
 # 开发环境 CORS：只允许 D1 前端本地 dev server
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]

@@ -1,11 +1,14 @@
-"""agent.llm 的消息模型、ToolSpec 转换与测试用假客户端。
+"""integration_agent.llm 的消息模型、ToolSpec 转换与测试用假客户端。
 
 场景分组：
     1. ChatMessage / AssistantTurn 校验
-    2. ToolSpec → DeepSeek function schema
+    2. ToolSpec → DeepSeek function schema（转换现在属于适配器 llm/deepseek.py）
     3. tool arguments 的不可信解析
     4. FakeToolCallingClient 与 ToolCallingClient 协议
     5. 安全边界（AST 白名单 + 不接触仓库 / 文件系统 / 网络）
+
+跨模块的依赖方向（llm 不依赖 agent / repair / api_server）由
+tests/test_llm_architecture.py 单独把关，本文件只管单个模块内部。
 
 这些用例全部离线、不读环境变量、不需要 API Key。
 """
@@ -18,13 +21,14 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from integration_agent.agent import llm
-from integration_agent.agent.llm import (
+from integration_agent.llm import (
     AssistantTurn,
     ChatMessage,
     FakeToolCallingClient,
     ToolCallingClient,
     ToolCallRequest,
+    client,
+    models,
     parse_tool_arguments,
     tool_spec_to_deepseek_function,
 )
@@ -33,15 +37,22 @@ from integration_agent.tools.models import ToolSpec
 
 SECRET_SENTINEL = "SENTINEL_SECRET_MUST_NOT_LEAK"
 
-# agent/llm.py 允许 import 的全部模块。做成白名单而不是黑名单：新增一个 import
-# 必须是有意识的决定，而不是"没被黑名单列到"就悄悄放行。
-# 特别地，这张表里没有 tools.registry —— 抽象层不认识 ToolRegistry。
-ALLOWED_LLM_IMPORTS = {
-    "copy",
+# llm/models.py 允许 import 的全部模块。做成白名单而不是黑名单：新增一个
+# import 必须是有意识的决定，而不是"没被黑名单列到"就悄悄放行。
+# 特别地，这张表里没有 tools.models：数据模型连 ToolSpec 都不需要认识。
+ALLOWED_MODELS_IMPORTS = {
     "json",
-    "collections.abc",
     "typing",
     "pydantic",
+}
+
+# llm/client.py 允许 import 的全部模块。ToolSpec 是**纯数据**声明
+# （"要提供哪些工具"本来就与 provider 无关），所以它可以出现在契约层；
+# tools.registry 不行 —— 契约层不认识 ToolRegistry，也没有执行工具的入口。
+ALLOWED_CLIENT_IMPORTS = {
+    "collections.abc",
+    "typing",
+    "integration_agent.llm.models",
     "integration_agent.tools.models",
 }
 
@@ -517,7 +528,7 @@ def test_fake_client_walks_through_a_tool_call_then_a_final_answer() -> None:
     )
     messages = [ChatMessage(role="user", content="项目里哪里用了 httpx？")]
 
-    first = fake.chat(messages, tools=[{"type": "function", "function": {"name": "search_code"}}])
+    first = fake.chat(messages, tools=[ToolSpec(name="search_code", description="搜索")])
 
     assert first.finish_reason == "tool_calls"
     assert first.tool_calls[0].parsed_arguments().arguments == {"query": "httpx"}
@@ -534,14 +545,16 @@ def test_fake_client_walks_through_a_tool_call_then_a_final_answer() -> None:
 
 def test_fake_client_records_requests_and_tools() -> None:
     fake = FakeToolCallingClient(AssistantTurn(content="好"))
-    tools = [{"type": "function", "function": {"name": "search_code"}}]
+    tools = [ToolSpec(name="search_code", description="搜索")]
     messages = [ChatMessage(role="user", content="你好")]
 
     fake.chat(messages, tools=tools, tool_choice="auto")
 
     assert fake.calls == 1
     assert fake.requests[0] == messages
+    # 记录的是调用方给的 ToolSpec 原样：假客户端也不做任何 provider 转换
     assert fake.tools[0] == tools
+    assert all(isinstance(spec, ToolSpec) for spec in fake.tools[0])
 
 
 def test_fake_client_returns_the_same_turn_when_only_one_is_given() -> None:
@@ -586,24 +599,39 @@ def test_fake_client_does_not_execute_tools() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_llm_module_imports_only_allowlisted_modules() -> None:
-    imported = _imported_modules(Path(llm.__file__).resolve())
+def test_models_module_imports_only_allowlisted_modules() -> None:
+    imported = _imported_modules(Path(models.__file__).resolve())
 
-    extra = imported - ALLOWED_LLM_IMPORTS
-    assert not extra, f"agent/llm.py 出现了白名单之外的 import：{sorted(extra)}"
+    extra = imported - ALLOWED_MODELS_IMPORTS
+    assert not extra, f"llm/models.py 出现了白名单之外的 import：{sorted(extra)}"
 
 
-def test_llm_module_does_not_know_the_tool_registry() -> None:
-    imported = _imported_modules(Path(llm.__file__).resolve())
+def test_models_module_has_no_project_dependency_at_all() -> None:
+    """数据模型是纯的：连 ToolSpec 都不认识，更不会碰 tools 包。"""
+    imported = _imported_modules(Path(models.__file__).resolve())
 
-    # 抽象层只认识 ToolSpec（数据契约），不认识 ToolRegistry（执行入口）
+    assert not {item for item in imported if item.startswith("integration_agent")}
+
+
+def test_client_module_imports_only_allowlisted_modules() -> None:
+    imported = _imported_modules(Path(client.__file__).resolve())
+
+    extra = imported - ALLOWED_CLIENT_IMPORTS
+    assert not extra, f"llm/client.py 出现了白名单之外的 import：{sorted(extra)}"
+
+
+def test_client_module_does_not_know_the_tool_registry() -> None:
+    imported = _imported_modules(Path(client.__file__).resolve())
+
+    # 契约层只认识 ToolSpec（数据契约），不认识 ToolRegistry（执行入口）
     assert "integration_agent.tools.registry" not in imported
     assert "integration_agent.tools" not in imported
     assert "integration_agent.tools.models" in imported
 
 
-def test_llm_module_has_no_execution_or_network_capability() -> None:
-    imported = _imported_modules(Path(llm.__file__).resolve())
+@pytest.mark.parametrize("module", [models, client])
+def test_contract_modules_have_no_execution_or_network_capability(module) -> None:
+    imported = _imported_modules(Path(module.__file__).resolve())
 
     for forbidden in (
         "socket",
@@ -619,7 +647,7 @@ def test_llm_module_has_no_execution_or_network_capability() -> None:
         "tempfile",
         "pickle",
     ):
-        assert forbidden not in imported, f"agent/llm.py 引入了能力模块 {forbidden}"
+        assert forbidden not in imported, f"{Path(module.__file__).name} 引入了能力模块 {forbidden}"
 
 
 def test_conversion_reads_only_the_spec_fields() -> None:

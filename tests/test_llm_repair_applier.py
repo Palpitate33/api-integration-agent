@@ -25,7 +25,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from integration_agent import generation, repair, validation
+from integration_agent import generation, llm, repair, validation
 
 
 def _artifacts() -> generation.GeneratedArtifacts:
@@ -92,7 +92,7 @@ def _result() -> validation.TestResult:
 
 
 def _applier(responses: str | list[str], **kwargs) -> repair.StructuredLLMRepairApplier:
-    return repair.StructuredLLMRepairApplier(repair.FakeLLMClient(responses), **kwargs)
+    return repair.StructuredLLMRepairApplier(llm.FakeLLMClient(responses), **kwargs)
 
 
 def _modify_response(path: str = "src/client.py", content: str = "VALUE = 2\n") -> str:
@@ -279,7 +279,7 @@ def test_max_changes_enforced() -> None:
         for index in range(6)
     ]
     applier = repair.StructuredLLMRepairApplier(
-        repair.FakeLLMClient(json.dumps({"changes": changes, "summary": "", "warnings": []})),
+        llm.FakeLLMClient(json.dumps({"changes": changes, "summary": "", "warnings": []})),
         max_changes=5,
     )
     result = applier.apply(
@@ -314,7 +314,7 @@ def test_duplicate_paths_rejected() -> None:
 
 def test_single_file_too_large_skipped() -> None:
     applier = repair.StructuredLLMRepairApplier(
-        repair.FakeLLMClient(_modify_response(content="X" * 30)),
+        llm.FakeLLMClient(_modify_response(content="X" * 30)),
         max_file_content_chars=10,
     )
     result = applier.apply(_artifacts(), _plan(), _result())
@@ -329,7 +329,7 @@ def test_total_content_too_large_skipped() -> None:
         {"path": "src/b.py", "action": "create", "content": "B" * 15, "reason": ""},
     ]
     applier = repair.StructuredLLMRepairApplier(
-        repair.FakeLLMClient(json.dumps({"changes": changes, "summary": "", "warnings": []})),
+        llm.FakeLLMClient(json.dumps({"changes": changes, "summary": "", "warnings": []})),
         max_total_content_chars=20,
     )
     result = applier.apply(_artifacts(), _plan(files=["src/a.py", "src/b.py"]), _result())
@@ -342,7 +342,7 @@ def test_total_content_too_large_skipped() -> None:
 
 
 def test_should_repair_false_does_not_call_llm() -> None:
-    client = repair.FakeLLMClient(_modify_response())
+    client = llm.FakeLLMClient(_modify_response())
     applier = repair.StructuredLLMRepairApplier(client)
     result = applier.apply(_artifacts(), _plan(should_repair=False), _result())
 
@@ -730,14 +730,14 @@ def test_repair_loop_applies_authorized_and_skips_unauthorized() -> None:
 
 def test_protocol_conformance() -> None:
     assert isinstance(_applier(_modify_response()), repair.LLMRepairApplier)
-    assert isinstance(repair.FakeLLMClient(""), repair.LLMClient)
+    assert isinstance(llm.FakeLLMClient(""), llm.LLMClient)
 
 
 # ------------------------------------------------------ prompt 上下文受限
 
 
 def test_prompt_is_bounded() -> None:
-    client = repair.FakeLLMClient(_modify_response())
+    client = llm.FakeLLMClient(_modify_response())
     _applier(_modify_response())  # 占位，避免误用
     applier = repair.StructuredLLMRepairApplier(client)
     applier.apply(_artifacts(), _plan(), _result())

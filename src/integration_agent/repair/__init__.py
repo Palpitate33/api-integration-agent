@@ -12,18 +12,15 @@
 
 约束：只分析、只在内存中变换生成产物、只编排注入组件——不修改仓库、
 不创建/删除文件、不执行 shell / git、不发网络请求、不安装依赖、不编造代码。
+
+LLM 契约与 provider 适配器不在这里
+----------------------------------
+``LLMClient`` / ``FakeLLMClient`` 是**跨 domain 共享**的契约（Repair 与 Planner
+都在用），``DeepSeekLLMClient`` 是 provider 适配器：两者都归属
+``integration_agent.llm``，本包不转出、也不保留任何 deprecated 的 transport
+再导出。需要它们请直接 ``from integration_agent.llm import ...``。
 """
 
-from integration_agent.repair.deepseek_client import (
-    DEFAULT_MODEL,
-    DeepSeekAPIError,
-    DeepSeekConfigError,
-    DeepSeekLLMClient,
-    DeepSeekLLMError,
-    DeepSeekResponseError,
-    DeepSeekTimeoutError,
-)
-from integration_agent.repair.llm_client import FakeLLMClient, LLMClient
 from integration_agent.repair.llm_repair_applier import (
     LLMRepairApplier,
     StructuredLLMRepairApplier,
@@ -58,17 +55,8 @@ from integration_agent.repair.repair_planner import (
 
 __all__ = [
     "DEFAULT_MAX_ITERATIONS",
-    "DEFAULT_MODEL",
-    "DeepSeekAPIError",
-    "DeepSeekConfigError",
-    "DeepSeekLLMClient",
-    "DeepSeekLLMError",
-    "DeepSeekResponseError",
-    "DeepSeekTimeoutError",
     "DeterministicRepairApplier",
     "DeterministicRepairPlanner",
-    "FakeLLMClient",
-    "LLMClient",
     "LLMFileChange",
     "LLMRepairApplier",
     "LLMRepairResponse",
