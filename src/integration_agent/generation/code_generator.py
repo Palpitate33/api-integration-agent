@@ -15,6 +15,21 @@
     - authentication    → 环境变量读取 + 请求头注入，绝不硬编码 secret
     - error_handling    → 状态码到异常的映射；retryable=True 才生成 429/5xx 重试与退避
     - testing_strategy  → 测试文件骨架（只生成代码，不执行测试）
+
+不可信文本
+----------
+target_api.name / endpoint.path / operationId / 参数名 / schema $ref / 依赖名……
+全部来自 OpenAPI，是**外部输入**。它们会出现在生成源码的三类位置上，各有各的
+渲染方式（见 `generation.rendering`）：
+
+    标识符位置（类名 / 方法名 / 形参名 / 模块路径）→ identifier() / module_path()
+    字符串位置（URL、请求头名、查询参数名、环境变量名、字面量）→ string_literal()
+    文档位置（模块 / 类 / 方法的 docstring）              → docstring()
+
+三条路径都是白名单式的：不做字符黑名单过滤，而是把文本渲染成**结构上不可能
+越界**的片段。所以文本里出现引号、反斜杠、换行、`@` 都不会改变生成代码的
+语法结构——它们只是被转义的数据。新增插入点时请沿用这三个函数，
+不要退回 f-string 直接拼接。
 """
 
 import re
@@ -33,6 +48,12 @@ from integration_agent.generation.models import (
     DependencyChange,
     GeneratedArtifacts,
     GeneratedFile,
+)
+from integration_agent.generation.rendering import (
+    docstring,
+    identifier,
+    module_path,
+    string_literal,
 )
 
 # OpenAPI schema 类型 → Python 类型提示
@@ -121,7 +142,7 @@ class DeterministicCodeGenerator:
         exceptions_module = _import_of_kind(plan, "exceptions")
         models_module = _import_of_kind(plan, "models")
         config_module = _import_of_kind(plan, "config")
-        exception_type = plan.error_handling.exception_type
+        exception_type = _exception_base(plan)
         exception_names = [exception_type] + [
             _exception_class(rule, exception_type) for rule in plan.error_handling.rules
         ]
@@ -131,10 +152,11 @@ class DeterministicCodeGenerator:
         needs_base64 = auth is not None and auth.scheme == "http-basic"
 
         lines = [
-            f'"""{purpose}（由 APIForge 生成）。',
-            "",
-            "base_url 与认证凭据从环境变量读取（见 config 模块）；不包含任何硬编码凭据。",
-            '"""',
+            docstring(
+                f"{purpose}（由 APIForge 生成）。\n"
+                "\n"
+                "base_url 与认证凭据从环境变量读取（见 config 模块）；不包含任何硬编码凭据。\n"
+            ),
             "from __future__ import annotations",
             "",
         ]
@@ -164,7 +186,7 @@ class DeterministicCodeGenerator:
         lines += ["", ""]
 
         lines.append(f"class {class_name}:")
-        lines.append(f'    """{plan.target_api.name} 客户端。"""')
+        lines.append(docstring(f"{plan.target_api.name} 客户端。", "    "))
         lines.append("")
         if retryable_rules:
             lines += ["    _max_retries = 3", ""]
@@ -173,7 +195,7 @@ class DeterministicCodeGenerator:
         if config_module:
             init_args.append("base_url: str | None = None")
         else:
-            init_args.append(f'base_url: str = "{plan.target_api.base_url or ""}"')
+            init_args.append(f"base_url: str = {string_literal(plan.target_api.base_url or '')}")
         init_args.extend(_auth_ctor_args(auth))
         init_args.extend(["timeout: float = 10.0", "transport: httpx.BaseTransport | None = None"])
         lines.append(f"    def __init__({', '.join(init_args)}) -> None:")
@@ -182,8 +204,11 @@ class DeterministicCodeGenerator:
             lines.append('        self._base_url = (base_url or config.BASE_URL or "").rstrip("/")')
             lines.append("        if not self._base_url:")
             lines.append(
-                '            raise ValueError("缺少 base_url：请通过参数或 '
-                f'{slug.upper()}_BASE_URL 环境变量提供")'
+                "            raise ValueError("
+                + string_literal(
+                    f"缺少 base_url：请通过参数或 {slug.upper()}_BASE_URL 环境变量提供"
+                )
+                + ")"
             )
         else:
             lines.append('        self._base_url = base_url.rstrip("/")')
@@ -192,9 +217,10 @@ class DeterministicCodeGenerator:
         lines.append("")
 
         if auth is not None:
+            scheme = auth.scheme
             lines.append("    def _build_headers(self) -> dict[str, str]:")
             lines.append(
-                f'        """按 AuthenticationPlan 注入认证凭据（scheme: {auth.scheme}）。"""'
+                docstring(f"按 AuthenticationPlan 注入认证凭据（scheme: {scheme}）。", "        ")
             )
             lines.append("        headers: dict[str, str] = {}")
             lines.extend(_auth_headers_lines(auth))
@@ -262,7 +288,13 @@ class DeterministicCodeGenerator:
             "    def _is_retryable(self, method: str, status_code: int) -> bool:",
             '        """按 ErrorHandlingPlan 判断是否重试：429 一律可重试，5xx 仅幂等方法。"""',
         ]
-        specific = [rule.status_code for rule in retryable_rules if rule.status_code.isdigit()]
+        # 只收能解析成整数的状态码：`{<任意文本>}` 本身就可能是一行非法/注入的源码
+        # （`str.isdigit()` 会放过 "²" 这类 Unicode 数字，所以这里用 ASCII 判定）
+        specific = [
+            code
+            for code in (_status_code_int(rule.status_code) for rule in retryable_rules)
+            if code is not None
+        ]
         has_5xx = any(rule.status_code == "5xx" for rule in retryable_rules)
         if specific:
             codes = "{" + ", ".join(str(code) for code in specific) + "}"
@@ -288,7 +320,7 @@ class DeterministicCodeGenerator:
     def _raise_for_status_lines(
         plan: IntegrationPlan, auth: AuthenticationPlan | None
     ) -> list[str]:
-        exception_type = plan.error_handling.exception_type
+        exception_type = _exception_base(plan)
         lines = [
             "    def _raise_for_status(self, response: httpx.Response) -> NoReturn:",
             '        """把错误状态码映射为结构化异常（来自 ErrorHandlingPlan）。"""',
@@ -298,18 +330,23 @@ class DeterministicCodeGenerator:
         if auth is not None and auth.required_env_vars:
             auth_hint = f"，请检查 {auth.required_env_vars[0]}"
         for rule in plan.error_handling.rules:
+            condition = _status_condition(rule.status_code)
+            if condition is None:
+                # status_code 不是 "5xx" 也不是数字（OpenAPI 允许 "default" 这类响应键，
+                # LLM 生成的计划更不受约束）。没有能拼进比较式的安全写法，就整条跳过，
+                # 该状态码落到末尾的通用异常上——总比生成 `if code == <任意文本>:` 好。
+                continue
             name = _exception_class(rule, exception_type)
             label = ERROR_LABELS.get(rule.category, rule.category)
             if rule.category == "authentication" and auth_hint:
-                detail = f"{label}（HTTP {{code}}{auth_hint}）"
+                detail = f"{label}（HTTP {{code}}{auth_hint}）: {{response.text}}"
             else:
-                detail = f"{label}（HTTP {{code}}）"
-            if rule.status_code == "5xx":
-                lines.append("        if code >= 500:")
-            else:
-                lines.append(f"        if code == {rule.status_code}:")
-            lines.append(f'            raise {name}(f"{detail}: {{response.text}}")')
-        lines.append(f'        raise {exception_type}(f"HTTP {{code}}: {{response.text}}")')
+                detail = f"{label}（HTTP {{code}}）: {{response.text}}"
+            lines.append(f"        if {condition}:")
+            lines.append(f"            raise {name}({_message_expr(detail)})")
+        lines.append(
+            f"        raise {exception_type}({_message_expr('HTTP {code}: {response.text}')})"
+        )
         lines.append("")
         return lines
 
@@ -319,55 +356,67 @@ class DeterministicCodeGenerator:
     ) -> list[str]:
         endpoint = planned.endpoint
         name = _endpoint_name(endpoint)
-        path_params = [p for p in endpoint.parameters if p.location == "path"]
-        query_params = [p for p in endpoint.parameters if p.location == "query"]
-        header_params = [p for p in endpoint.parameters if p.location == "header"]
-        cookie_params = [p for p in endpoint.parameters if p.location == "cookie"]
+        # 名字在**整个端点**范围内一次性分配（见 _param_arg_names），所以下面按
+        # location 分组时必须带着原始下标走，不能各自再 _py_arg() 一次：
+        # 签名、url 替换、params/headers/cookies、测试调用参数必须是同一批名字。
+        arg_names = _param_arg_names(endpoint)
+        grouped = [
+            [
+                (param, arg_names[index])
+                for index, param in enumerate(endpoint.parameters)
+                if param.location == location
+            ]
+            for location in ("path", "query", "header", "cookie")
+        ]
+        path_params, query_params, header_params, cookie_params = grouped
         body = endpoint.request_body
 
-        sig = ["self", "*"]
-        for param in path_params:
+        # `*` 只在**确实存在**关键字参数时才写：无参数且无 body 的端点原本会生成
+        # `def health_check(self, *) -> None:`——那是 SyntaxError，不是风格问题。
+        keyword_only: list[str] = []
+        for param, arg in path_params:
             hint = _type_hint(param.schema_type)
-            arg = _py_arg(param.name)
-            sig.append(f"{arg}: {hint}" if param.required else f"{arg}: {hint} | None = None")
-        for param in query_params + header_params + cookie_params:
-            sig.append(f"{_py_arg(param.name)}: {_type_hint(param.schema_type)} | None = None")
+            suffix = "" if param.required else " | None = None"
+            keyword_only.append(f"{arg}: {hint}{suffix}")
+        for param, arg in query_params + header_params + cookie_params:
+            keyword_only.append(f"{arg}: {_type_hint(param.schema_type)} | None = None")
         if body is not None:
             if body.schema_ref:
-                sig.append(f"payload: {_model_name(body.schema_ref)}")
+                keyword_only.append(f"payload: {_model_name(body.schema_ref)}")
             else:
-                sig.append("payload: dict[str, Any]")
+                keyword_only.append("payload: dict[str, Any]")
+        sig = ["self"]
+        if keyword_only:
+            sig.append("*")
+            sig.extend(keyword_only)
 
         doc = planned.purpose or endpoint.summary or f"{endpoint.method} {endpoint.path}"
         lines = [
             f"    def {name}({', '.join(sig)}) -> {_return_type(endpoint)}:",
-            f'        """{doc}"""',
+            docstring(doc, "        "),
         ]
-        url = f'        url = self._base_url + "{endpoint.path}"'
-        for param in path_params:
-            url += f'.replace("{{{param.name}}}", str({_py_arg(param.name)}))'
+        url = f"        url = self._base_url + {string_literal(endpoint.path)}"
+        for param, arg in path_params:
+            url += f".replace({string_literal('{' + param.name + '}')}, str({arg}))"
         lines.append(url)
 
         if query_params:
             lines.append("        params: dict[str, Any] = {}")
-            for param in query_params:
-                arg = _py_arg(param.name)
+            for param, arg in query_params:
                 lines.append(f"        if {arg} is not None:")
-                lines.append(f'            params["{param.name}"] = {arg}')
+                lines.append(f"            params[{string_literal(param.name)}] = {arg}")
         if auth is not None:
             lines.append("        headers = self._build_headers()")
         elif header_params:
             lines.append("        headers: dict[str, str] = {}")
-        for param in header_params:
-            arg = _py_arg(param.name)
+        for param, arg in header_params:
             lines.append(f"        if {arg} is not None:")
-            lines.append(f'            headers["{param.name}"] = {arg}')
+            lines.append(f"            headers[{string_literal(param.name)}] = {arg}")
         if cookie_params:
             lines.append("        cookies: dict[str, str] = {}")
-            for param in cookie_params:
-                arg = _py_arg(param.name)
+            for param, arg in cookie_params:
                 lines.append(f"        if {arg} is not None:")
-                lines.append(f'            cookies["{param.name}"] = {arg}')
+                lines.append(f"            cookies[{string_literal(param.name)}] = {arg}")
 
         call_args: list[str] = []
         if query_params:
@@ -383,12 +432,13 @@ class DeterministicCodeGenerator:
             call_args.append("cookies=cookies")
         if call_args:
             lines.append("        response = self._request(")
-            lines.append(f'            "{endpoint.method}", url,')
+            lines.append(f"            {string_literal(endpoint.method)}, url,")
             for arg in call_args:
                 lines.append(f"            {arg},")
             lines.append("        )")
         else:
-            lines.append(f'        response = self._request("{endpoint.method}", url)')
+            method = string_literal(endpoint.method)
+            lines.append(f"        response = self._request({method}, url)")
         lines.append(_return_statement(endpoint))
         lines.append("")
         return lines
@@ -409,11 +459,12 @@ class DeterministicCodeGenerator:
                 if items:
                     response_refs.add(_model_name(items))
         lines = [
-            f'"""{plan.target_api.name} 的数据模型（由 APIForge 生成）。',
-            "",
-            "字段定义以 OpenAPI components/schemas 为准；当前生成器只生成允许",
-            "额外字段的占位模型，字段级模型由 LLMCodeGenerator 阶段补充。",
-            '"""',
+            docstring(
+                f"{plan.target_api.name} 的数据模型（由 APIForge 生成）。\n"
+                "\n"
+                "字段定义以 OpenAPI components/schemas 为准；当前生成器只生成允许\n"
+                "额外字段的占位模型，字段级模型由 LLMCodeGenerator 阶段补充。\n"
+            ),
             "",
         ]
         if names:
@@ -427,7 +478,7 @@ class DeterministicCodeGenerator:
                 elif name in response_refs:
                     role = "响应模型"
                 lines.append(f"class {name}(BaseModel):")
-                lines.append(f'    """OpenAPI schema 对应的{role}。"""')
+                lines.append(docstring(f"OpenAPI schema 对应的{role}。", "    "))
                 lines.append('    model_config = ConfigDict(extra="allow")')
                 lines.append("")
         else:
@@ -437,16 +488,17 @@ class DeterministicCodeGenerator:
 
     @staticmethod
     def _exceptions_module(plan: IntegrationPlan) -> str:
-        exception_type = plan.error_handling.exception_type
+        exception_type = _exception_base(plan)
         lines = [
-            f'"""{plan.target_api.name} 的异常层次（由 APIForge 生成）。',
-            "",
-            "每个异常对应 ErrorHandlingPlan 中的一条规则；重试行为由客户端实现",
-            f"（见 {_class_name(plan)}._is_retryable）。",
-            '"""',
+            docstring(
+                f"{plan.target_api.name} 的异常层次（由 APIForge 生成）。\n"
+                "\n"
+                "每个异常对应 ErrorHandlingPlan 中的一条规则；重试行为由客户端实现\n"
+                f"（见 {_class_name(plan)}._is_retryable）。\n"
+            ),
             "",
             f"class {exception_type}(Exception):",
-            f'    """{plan.target_api.name} 调用错误的基类。"""',
+            docstring(f"{plan.target_api.name} 调用错误的基类。", "    "),
             "",
         ]
         for rule in plan.error_handling.rules:
@@ -454,7 +506,7 @@ class DeterministicCodeGenerator:
             label = ERROR_LABELS.get(rule.category, rule.category)
             retry = "可重试" if rule.retryable else "不重试"
             lines.append(f"class {name}({exception_type}):")
-            lines.append(f'    """HTTP {rule.status_code}：{label}（{retry}）。"""')
+            lines.append(docstring(f"HTTP {rule.status_code}：{label}（{retry}）。", "    "))
             lines.append("")
         return "\n".join(lines)
 
@@ -463,24 +515,28 @@ class DeterministicCodeGenerator:
         slug = _slug(plan)
         auth = plan.authentication
         lines = [
-            f'"""{plan.target_api.name} 配置（由 APIForge 生成）。',
-            "",
-            "所有配置从环境变量读取；禁止把真实凭据写入代码或提交到版本库。",
-            '"""',
+            docstring(
+                f"{plan.target_api.name} 配置（由 APIForge 生成）。\n"
+                "\n"
+                "所有配置从环境变量读取；禁止把真实凭据写入代码或提交到版本库。\n"
+            ),
             "",
             "import os",
             "",
         ]
         env_base = f"{slug.upper()}_BASE_URL"
         if plan.target_api.base_url:
-            lines.append(f'BASE_URL = os.environ.get("{env_base}", "{plan.target_api.base_url}")')
+            lines.append(
+                "BASE_URL = os.environ.get("
+                f"{string_literal(env_base)}, {string_literal(plan.target_api.base_url)})"
+            )
         else:
             lines.append("# OpenAPI 未声明 servers：base_url 必须由使用方显式提供")
-            lines.append(f'BASE_URL = os.environ.get("{env_base}")')
+            lines.append(f"BASE_URL = os.environ.get({string_literal(env_base)})")
         if auth is not None:
             for env_var in auth.required_env_vars:
                 var = _auth_config_var(env_var, slug)
-                lines.append(f'{var} = os.environ.get("{env_var}")')
+                lines.append(f"{var} = os.environ.get({string_literal(env_var)})")
             if auth.scheme == "oauth2":
                 lines.append("# CLIENT_ID / CLIENT_SECRET 用于 client credentials 流程；")
                 lines.append("# access token 的获取与刷新由使用方接入。")
@@ -488,15 +544,18 @@ class DeterministicCodeGenerator:
 
     @staticmethod
     def _package_init_module(plan: IntegrationPlan) -> str:
+        class_name = _class_name(plan)
+        exception_type = _exception_base(plan)
+        slug = _slug(plan)
         lines = [
-            f'"""{plan.target_api.name} 集成包（由 APIForge 生成）。"""',
+            docstring(f"{plan.target_api.name} 集成包（由 APIForge 生成）。"),
             "",
-            f"from .{_slug(plan)}_client import {_class_name(plan)}",
-            f"from .{_slug(plan)}_exceptions import {plan.error_handling.exception_type}",
+            f"from .{slug}_client import {class_name}",
+            f"from .{slug}_exceptions import {exception_type}",
             "",
             "__all__ = [",
-            f'    "{_class_name(plan)}",',
-            f'    "{plan.error_handling.exception_type}",',
+            f"    {string_literal(class_name)},",
+            f"    {string_literal(exception_type)},",
             "]",
         ]
         return "\n".join(lines) + "\n"
@@ -573,12 +632,12 @@ class DeterministicCodeGenerator:
         client_module = _import_of_kind(plan, "client")
         exceptions_module = _import_of_kind(plan, "exceptions")
         models_module = _import_of_kind(plan, "models")
-        exception_type = plan.error_handling.exception_type
+        exception_type = _exception_base(plan)
         rule_classes = [_exception_class(r, exception_type) for r in plan.error_handling.rules]
         model_names = _referenced_models(plan)
         needs_json = any(p.endpoint.request_body is not None for p in plan.endpoints)
 
-        lines = [f'"""{spec.purpose}（由 APIForge 生成）。"""', ""]
+        lines = [docstring(f"{spec.purpose}（由 APIForge 生成）。"), ""]
         if needs_json:
             lines += ["import json", ""]
         lines += ["import httpx", "", f"from {client_module} import {class_name}", ""]
@@ -614,17 +673,21 @@ class DeterministicCodeGenerator:
 
         lines = [
             f"def test_{name}() -> None:",
-            f'    """{planned.purpose}"""',
+            docstring(planned.purpose, "    "),
             "",
             "    def handler(request: httpx.Request) -> httpx.Response:",
-            f'        assert request.method == "{endpoint.method}"',
-            f'        assert request.url.path == "{expected_path}"',
+            f"        assert request.method == {string_literal(endpoint.method)}",
+            f"        assert request.url.path == {string_literal(expected_path)}",
         ]
         for param in endpoint.parameters:
             if param.location == "query":
-                lines.append(f'        assert request.url.params["{param.name}"] == "10"')
+                lines.append(
+                    f'        assert request.url.params[{string_literal(param.name)}] == "10"'
+                )
             elif param.location == "header":
-                lines.append(f'        assert request.headers["{param.name}"] == "trace-1"')
+                lines.append(
+                    f'        assert request.headers[{string_literal(param.name)}] == "trace-1"'
+                )
         if body is not None:
             lines.append("        body = json.loads(request.content)")
             if body.schema_ref:
@@ -654,7 +717,7 @@ class DeterministicCodeGenerator:
         call_name = _endpoint_name(first.endpoint)
         needs_base64 = auth is not None and auth.scheme == "http-basic"
 
-        lines = [f'"""{spec.purpose}（由 APIForge 生成）。"""', ""]
+        lines = [docstring(f"{spec.purpose}（由 APIForge 生成）。"), ""]
         if needs_base64:
             lines += ["import base64", ""]
         lines += ["import httpx", ""]
@@ -662,13 +725,14 @@ class DeterministicCodeGenerator:
             lines += ["import pytest", ""]
         lines += [f"from {client_module} import {class_name}", ""]
         if retryable_rules:
+            exception_type = _exception_base(plan)
             rate_limit = next(
                 (
-                    _exception_class(r, plan.error_handling.exception_type)
+                    _exception_class(r, exception_type)
                     for r in retryable_rules
                     if r.category == "rate_limit"
                 ),
-                _exception_class(retryable_rules[0], plan.error_handling.exception_type),
+                _exception_class(retryable_rules[0], exception_type),
             )
             exceptions_module = _import_of_kind(plan, "exceptions")
             lines.append(f"from {exceptions_module} import {rate_limit}")
@@ -680,8 +744,8 @@ class DeterministicCodeGenerator:
             '    """端到端调用"""',
             "",
             "    def handler(request: httpx.Request) -> httpx.Response:",
-            f'        assert request.method == "{first.endpoint.method}"',
-            f'        assert request.url.path == "{first.endpoint.path}"',
+            f"        assert request.method == {string_literal(first.endpoint.method)}",
+            f"        assert request.url.path == {string_literal(first.endpoint.path)}",
             "        " + _dummy_response(first.endpoint),
             "",
             f"    client = {class_name}(",
@@ -734,7 +798,7 @@ class DeterministicCodeGenerator:
         models_module = _import_of_kind(plan, "models")
         model_names = _referenced_models(plan)
         lines = [
-            f'"""{spec.purpose}（由 APIForge 生成）。"""',
+            docstring(f"{spec.purpose}（由 APIForge 生成）。"),
             "",
             "import httpx",
             "",
@@ -753,10 +817,10 @@ class DeterministicCodeGenerator:
             call_args, expected_path = _test_call_args(endpoint)
             lines += [
                 f"def test_{name}_response_matches_schema() -> None:",
-                f'    """{planned.purpose}"""',
+                docstring(planned.purpose, "    "),
                 "",
                 "    def handler(request: httpx.Request) -> httpx.Response:",
-                f'        assert request.url.path == "{expected_path}"',
+                f"        assert request.url.path == {string_literal(expected_path)}",
                 "        " + _dummy_response(endpoint),
                 "",
                 f"    client = {class_name}(",
@@ -785,17 +849,21 @@ def _pascal(slug: str) -> str:
 
 
 def _slug(plan: IntegrationPlan) -> str:
-    """从 client_module 文件名推导 slug（如 demo_petstore_client.py → demo_petstore）。"""
+    """从 client_module 文件名推导 slug（如 demo_petstore_client.py → demo_petstore）。
+
+    client_module 是外部输入（LLM 计划里的路径），而 slug 会继续长成类名、
+    模块名、环境变量前缀，所以出口处收敛成标识符。
+    """
     name = plan.integration_strategy.client_module.rsplit("/", 1)[-1]
     if name.endswith(".py"):
         name = name[: -len(".py")]
     if name.endswith("_client"):
         name = name[: -len("_client")]
-    return name
+    return identifier(name, fallback="api")
 
 
 def _class_name(plan: IntegrationPlan) -> str:
-    return f"{_pascal(_slug(plan))}Client"
+    return identifier(f"{_pascal(_slug(plan))}Client", fallback="APIClient")
 
 
 def _file_of_kind(plan: IntegrationPlan, kind: str) -> str | None:
@@ -818,7 +886,11 @@ def _import_of_kind(plan: IntegrationPlan, kind: str) -> str | None:
 
 
 def _import_module(path: str) -> str:
-    """文件路径 → 可导入的模块路径；src/lib 容器前缀不属于导入路径。"""
+    """文件路径 → 可导入的模块路径；src/lib 容器前缀不属于导入路径。
+
+    路径来自计划（外部输入），会出现 `from {module} import X` 的标识符位置，
+    所以逐段收敛（见 rendering.module_path）。
+    """
     module = path
     for container in ("src/", "lib/"):
         if module.startswith(container):
@@ -826,12 +898,12 @@ def _import_module(path: str) -> str:
             break
     if module.endswith(".py"):
         module = module[: -len(".py")]
-    return module.replace("/", ".")
+    return module_path(module.replace("/", "."))
 
 
 def _model_name(ref: str) -> str:
     """schema $ref 名称 → 合法且稳定的 Python 类名。"""
-    return _pascal(_to_snake(ref))
+    return identifier(_pascal(_to_snake(ref)), fallback="Model")
 
 
 def _type_hint(schema_type: str | None) -> str:
@@ -839,7 +911,41 @@ def _type_hint(schema_type: str | None) -> str:
 
 
 def _py_arg(name: str) -> str:
-    return _to_snake(name)
+    """参数名 → snake_case 标识符。
+
+    单个名字的收敛在这里；**同一端点内的重名/占名**由 _param_arg_names 处理——
+    那是跨参数的约束，单独看一个名字看不出来。
+    """
+    return identifier(_to_snake(name), fallback="param")
+
+
+# 方法体里已经在用的名字：形参一旦撞上它们，`url = self._base_url + ...` 之后
+# `if url is not None:` 判断的就是另一个变量了——语法合法，语义悄悄错掉。
+_RESERVED_ARG_NAMES = frozenset(
+    {"self", "payload", "url", "params", "headers", "cookies", "response"}
+)
+
+
+def _param_arg_names(endpoint: APIEndpoint) -> list[str]:
+    """端点的全部参数 → 互不冲突的形参名（与 endpoint.parameters 同序）。
+
+    两个不同的参数清洗后可能撞成同一个名字（`per-page` 与 `per_page`），也可能
+    撞上方法体自己的局部变量（`url`）。重名不是风格问题：`def f(self, *, url, url)`
+    是 SyntaxError。签名、URL 替换、params/headers/cookies、测试调用参数必须共用
+    同一份名字，所以名字只能在**端点范围内**分配一次。
+    """
+    names: list[str] = []
+    used: set[str] = set()
+    for param in endpoint.parameters:
+        base = _py_arg(param.name)
+        name = base
+        suffix = 2
+        while name in used or name in _RESERVED_ARG_NAMES:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        used.add(name)
+        names.append(name)
+    return names
 
 
 def _exception_class(rule: ErrorHandlingRule, exception_type: str) -> str:
@@ -853,18 +959,88 @@ def _exception_class(rule: ErrorHandlingRule, exception_type: str) -> str:
         base = base[: base.index("APIError")]
     elif base.endswith("Error"):
         base = base[: -len("Error")]
-    suffix = _pascal(rule.category)
+    # category 目前是 Literal（可信），但这里是**类名**位置：一旦模型放宽约束，
+    # 一段普通文本就能变成 `class X(A bError)`。收敛成本为零，不留这个假设。
+    suffix = identifier(_pascal(rule.category), fallback="Unknown")
     if suffix.endswith("Error"):
         suffix = suffix[: -len("Error")]
     return f"{base}{suffix}Error"
 
 
+def _exception_base(plan: IntegrationPlan) -> str:
+    """ErrorHandlingPlan.exception_type → 合法的异常基类名。
+
+    这个字段来自计划（LLM 生成时是完全自由的文本），却出现在三个标识符位置：
+    `class X(Exception)` / `raise X(...)` / `from ... import X`。
+    """
+    return identifier(plan.error_handling.exception_type, fallback="APIError")
+
+
 def _endpoint_name(endpoint: APIEndpoint) -> str:
-    """端点 → 方法名：优先 operationId 的 snake_case。"""
-    if endpoint.operation_id:
-        return _to_snake(endpoint.operation_id)
+    """端点 → 方法名：优先 operationId 的 snake_case。
+
+    operationId 是外部文本，且这里产出的是**方法名**（还会拼成 test_ 函数名）。
+    它可能被清洗成空串（operationId 全是标点），那时回退到 path 推导的名字，
+    而不是生成 `def (self):` ——空标识符同样是语法错误。
+    """
     token = re.sub(r"[^0-9a-zA-Z]+", "_", endpoint.path.replace("{", "").replace("}", ""))
-    return f"{endpoint.method.lower()}_{token.strip('_').lower()}"
+    fallback = f"{endpoint.method.lower()}_{token.strip('_').lower()}"
+    if endpoint.operation_id:
+        candidate = _to_snake(endpoint.operation_id)
+        if candidate:
+            return identifier(candidate, fallback="endpoint")
+    return identifier(fallback, fallback="endpoint")
+
+
+def _status_code_int(status_code: str) -> int | None:
+    """ErrorHandlingRule.status_code → 整数状态码；不是纯 ASCII 数字时返回 None。
+
+    刻意不用 str.isdigit()：它认 "²" / "٣" 这类 Unicode 数字，而 `int()` 对前者
+    直接抛 ValueError。生成器自己崩掉也是不可接受的——外部文本不该让生成失败。
+    """
+    if re.fullmatch(r"[0-9]+", status_code):
+        return int(status_code)
+    return None
+
+
+def _status_condition(status_code: str) -> str | None:
+    """status_code → 生成代码里的比较条件；无法表示为数字时返回 None。
+
+    status_code 是自由文本（OpenAPI 允许 "default" 这类响应键，LLM 计划里更不受
+    约束），而它会被拼进 `if code == {}:`。那是**代码位置**，不是字符串位置：
+    没有转义能救，只有"能解析成整数才允许进入"这一条路。
+    """
+    if status_code == "5xx":
+        return "code >= 500"
+    code = _status_code_int(status_code)
+    return f"code == {code}" if code is not None else None
+
+
+def _message_expr(template: str) -> str:
+    """运行期消息模板 → 生成代码里的表达式。
+
+    ``{code}`` 与 ``{response.text}`` 是仅有的两个占位符，分别替换为真实状态码与
+    响应正文。模板里除了这两个占位符外的部分是 OpenAPI 文本（异常提示、环境变量名），
+    通常就是一句普通中文——那种情况直接输出可读的 f-string。
+
+    只有文本里出现会破坏 f-string 结构的字符（引号 / 反斜杠 / 花括号 / 控制字符）时，
+    才回退到分段拼接：静态段走 string_literal()，动态段作为独立表达式拼回来。
+    与 rendering.docstring 同构——**回退路径才是通用正确的那个**，f-string 只是装饰。
+    """
+    static_text = re.sub(r"\{(?:code|response\.text)\}", "", template)
+    # 快路径的判据只看**非占位符**部分：去掉占位符后剩下的文本必须全是可打印字符，
+    # 且不含引号 / 反斜杠 / 花括号。占位符本身是我们要的字段，不算危险字符。
+    if static_text.isprintable() and not set(static_text) & {'"', "\\", "{", "}"}:
+        return f'f"{template}"'
+
+    pieces: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"\{(?:code|response\.text)\}", template):
+        pieces.append(string_literal(template[cursor : match.start()]))
+        pieces.append(match.group(0)[1:-1])
+        cursor = match.end()
+    pieces.append(string_literal(template[cursor:]))
+    return " + ".join(piece for piece in pieces if piece != '""') or '""'
 
 
 def _items_ref(response: APIResponse) -> str | None:
@@ -928,11 +1104,17 @@ def _return_statement(endpoint: APIEndpoint) -> str:
 
 
 def _auth_config_var(env_var: str, slug: str) -> str:
-    """环境变量名 → config 模块中的变量名（去掉 <SLUG>_ 前缀）。"""
+    """环境变量名 → config 模块中的变量名（去掉 <SLUG>_ 前缀）。
+
+    产出的是**模块级变量名**（`API_KEY = os.environ.get(...)`），所以同样要收敛；
+    环境变量名本身是外部文本，只剩最后一个下划线段时完全可能是任意内容。
+    """
     prefix = f"{slug.upper()}_"
     if env_var.startswith(prefix):
-        return env_var[len(prefix) :]
-    return env_var.rsplit("_", 1)[-1]
+        candidate = env_var[len(prefix) :]
+    else:
+        candidate = env_var.rsplit("_", 1)[-1]
+    return identifier(candidate, fallback="CREDENTIAL")
 
 
 def _auth_ctor_args(auth: AuthenticationPlan | None) -> list[str]:
@@ -980,7 +1162,7 @@ def _auth_headers_lines(auth: AuthenticationPlan) -> list[str]:
         header = auth.header_name or "X-API-Key"
         return [
             "        if self._api_key is not None:",
-            f'            headers["{header}"] = self._api_key',
+            f"            headers[{string_literal(header)}] = self._api_key",
         ]
     if auth.scheme == "http-bearer":
         return [
@@ -1018,7 +1200,7 @@ def _auth_test_args(auth: AuthenticationPlan) -> str:
 def _auth_assert_lines(auth: AuthenticationPlan) -> list[str]:
     if auth.scheme == "apiKey":
         header = auth.header_name or "X-API-Key"
-        return [f'assert request.headers.get("{header}") == "test-key"']
+        return [f'assert request.headers.get({string_literal(header)}) == "test-key"']
     if auth.scheme == "http-basic":
         return [
             'expected = "Basic " + base64.b64encode(b"test-user:test-pass").decode("ascii")',
@@ -1029,17 +1211,19 @@ def _auth_assert_lines(auth: AuthenticationPlan) -> list[str]:
 
 def _test_call_args(endpoint: APIEndpoint) -> tuple[list[str], str]:
     """生成测试中对端点方法的调用参数，并返回参数替换后的期望路径。"""
+    arg_names = _param_arg_names(endpoint)
     args: list[str] = []
     expected_path = endpoint.path
     for index, param in enumerate(endpoint.parameters):
+        arg = arg_names[index]
         if param.location == "path":
             value = f"test-{index + 1}"
-            args.append(f"{_py_arg(param.name)}={value!r}")
+            args.append(f"{arg}={value!r}")
             expected_path = expected_path.replace("{" + param.name + "}", value)
         elif param.location == "query":
-            args.append(f"{_py_arg(param.name)}=10")
+            args.append(f"{arg}=10")
         elif param.location == "header":
-            args.append(f'{_py_arg(param.name)}="trace-1"')
+            args.append(f'{arg}="trace-1"')
     body = endpoint.request_body
     if body is not None:
         if body.schema_ref:
@@ -1109,25 +1293,55 @@ def _contract_assert_lines(endpoint: APIEndpoint, indent: str) -> list[str]:
 def _manifest_snippet(item: FileModification) -> tuple[str, str]:
     """依赖清单的修改片段；changes 直接来自 plan.files_to_modify。"""
     if item.path.endswith("pyproject.toml"):
-        content = "\n".join(f'"{entry}",' for entry in item.changes) + "\n"
+        # 依赖名同样是外部文本；这里的输出是 TOML 基本字符串，
+        # JSON 字符串的转义在 " 与 \ 上与它一致，套用同一个渲染器即可
+        content = "\n".join(f"{string_literal(entry)}," for entry in item.changes) + "\n"
         return content, "[project] 的 dependencies 列表内"
-    return "\n".join(item.changes) + "\n", "文件末尾（每行一个依赖）"
+    lines = [line for line in map(_manifest_line, item.changes) if line]
+    return "\n".join(lines) + "\n", "文件末尾（每行一个依赖）"
+
+
+_MANIFEST_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _manifest_line(entry: str) -> str | None:
+    """requirements.txt 是**逐行**格式：条目里带换行就等于注入额外的清单行。
+
+    这里不做转义：清单行的语义由整行文本决定，把 ``foo\\n-e http://evil`` 转义成
+    一行只会得到一个同样畸形的依赖名。所以只接受本身就是单行、且不含控制字符的
+    条目，其余整条丢弃（连同其中的注入内容）。
+    """
+    if not entry.strip() or _MANIFEST_CONTROL.search(entry):
+        return None
+    return entry.strip()
 
 
 def _init_snippet(plan: IntegrationPlan) -> str:
+    """__init__.py 导出区片段。
+
+    两行都是**标识符位置**（`from X import Y` 的 Y）。exception_type 与 slug 一样
+    是计划里的自由文本：不收敛就贴进导出区，`APIError\\nimport os` 这样的取值会让
+    后面的语句变成文件正文。所以与其它标识符位置一样走 _exception_base() /
+    _class_name()——它们导出的正是 exceptions 模块里真正定义的那个类名。
+    """
     lines = [
         f"from .{_slug(plan)}_client import {_class_name(plan)}",
-        f"from .{_slug(plan)}_exceptions import {plan.error_handling.exception_type}",
+        f"from .{_slug(plan)}_exceptions import {_exception_base(plan)}",
     ]
     return "\n".join(lines) + "\n"
 
 
 def _usage_snippet(plan: IntegrationPlan) -> str:
-    module = _import_of_kind(plan, "client") or ""
+    class_name = _class_name(plan)
+    module = _import_of_kind(plan, "client")
+    if not module:
+        # 计划里没有 client 文件时没有可导入的模块路径，`from  import X` 是语法错误。
+        # 这段文本会被贴进真实文件，宁可只留一句提示，也不给出贴进去就报错的代码。
+        return f"# {class_name} 的导入路径取决于 client 文件的最终位置。\n"
     lines = [
-        f"from {module} import {_class_name(plan)}",
+        f"from {module} import {class_name}",
         "",
-        f"client = {_class_name(plan)}()  # base_url 与凭据从环境变量读取",
+        f"client = {class_name}()  # base_url 与凭据从环境变量读取",
     ]
     return "\n".join(lines) + "\n"
 
@@ -1140,7 +1354,8 @@ def _transport_snippet(plan: IntegrationPlan) -> str:
 
 
 def _placeholder_module(purpose: str) -> str:
-    return f'"""{purpose}（由 APIForge 生成）。"""\n\n# 该文件由 Planner 计划，具体内容待补充。\n'
+    doc = docstring(f"{purpose}（由 APIForge 生成）。")
+    return f"{doc}\n\n# 该文件由 Planner 计划，具体内容待补充。\n"
 
 
 def _is_advisory_modification(item: FileModification) -> bool:

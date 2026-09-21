@@ -18,6 +18,8 @@
 from integration_agent.validation.models import FailureDetail, TestResult
 from integration_agent.validation.test_runner import (
     DEFAULT_TIMEOUT,
+    NO_TESTS_EXECUTED_MESSAGE,
+    NO_TESTS_FAILURE_NAME,
     SUBPROCESS_ENV_ALLOWLIST,
     DependencyPreparer,
     DeterministicTestRunner,
@@ -29,6 +31,8 @@ from integration_agent.validation.test_runner import (
 
 __all__ = [
     "DEFAULT_TIMEOUT",
+    "NO_TESTS_EXECUTED_MESSAGE",
+    "NO_TESTS_FAILURE_NAME",
     "SUBPROCESS_ENV_ALLOWLIST",
     "DependencyPreparer",
     "DeterministicTestRunner",

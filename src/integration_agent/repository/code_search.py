@@ -23,6 +23,7 @@ from integration_agent.repository.scanner import (
     DEFAULT_IGNORED_DIRS,
     RepositoryError,
     iter_python_files,
+    resolve_inside_project,
     validate_project_root,
 )
 
@@ -91,13 +92,21 @@ def search_code(
     for file_path in iter_python_files(root_path, ignored_dirs=ignored_dirs):
         if stop:
             break
+        # 每个**最终读取目标**都要过边界：iter_python_files 只列候选，它用
+        # followlinks=False 挡住 symlink 目录，但名为 *.py 的 symlink 文件照样在列。
+        # 不解析就读，`link.py -> /etc/passwd` 会以"项目内文件"的名义把项目外的内容
+        # 送进搜索结果。判据与 read_file 工具一致：resolve 之后仍在 root 内才读。
+        resolved = resolve_inside_project(root_path, file_path)
+        if resolved is None:
+            continue
         try:
-            if file_path.stat().st_size > max_file_bytes:
+            if resolved.stat().st_size > max_file_bytes:
                 continue
-            text = file_path.read_text(encoding="utf-8", errors="replace")
+            text = resolved.read_text(encoding="utf-8", errors="replace")
         except OSError:  # pragma: no cover - 文件在扫描过程中消失或不可读
             continue
         files_scanned += 1
+        # 报告链接自身的路径：目标在项目内时才可能走到这里，用链接位置指路更准确
         relative_path = file_path.relative_to(root_path).as_posix()
 
         for index, line in enumerate(text.splitlines()):

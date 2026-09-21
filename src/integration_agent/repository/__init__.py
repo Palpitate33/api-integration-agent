@@ -15,6 +15,7 @@ from integration_agent.repository.scanner import (
     ProjectStructure,
     RepositoryError,
     iter_python_files,
+    resolve_inside_project,
     scan_repository,
 )
 
@@ -26,6 +27,7 @@ __all__ = [
     "RepositoryError",
     "SearchResult",
     "iter_python_files",
+    "resolve_inside_project",
     "scan_repository",
     "search_code",
 ]

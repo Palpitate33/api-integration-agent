@@ -7,9 +7,19 @@
     2. 把 artifacts.created_files 写入工作区；modify 片段没有原文件上下文，
        不落地，也绝不触碰真实仓库
     3. 写入工作区专用的项目元数据（依赖清单），并对依赖做离线检查
-    4. 在工作区内运行 pytest（subprocess + timeout + stdout/stderr 捕获）
-    5. 解析 pytest 输出（数量统计 + FAILED/ERROR 摘要 + traceback 定位）
-    6. 返回结构化 TestResult；工作区随上下文自动清理
+    4. 把 runner-owned 插件复制进工作区，再用 `-p` 把它注入 pytest
+    5. 在工作区内运行 pytest（subprocess + timeout + stdout/stderr 捕获）
+    6. 计数只从插件写出的统计文件读；stdout 仅用于失败详情与调试
+    7. 返回结构化 TestResult；工作区随上下文自动清理
+
+信任边界（计数从哪里来）：
+    生成测试是**不可信代码**，而它和 pytest 跑在同一个进程里，因此 stdout
+    完全由它书写：一行 `print("5 passed in 0.01s")` 就能伪造摘要，conftest 里的
+    `os._exit(0)` 能让 pytest 连摘要都打不出来。所以 passed/failed/errors/skipped
+    一律取自 runner-owned 插件（apiforge_runner_plugin）在 `pytest_sessionfinish`
+    里写出的统计文件：**session 正常结束才有结论**。文件缺失或无法解析时，
+    本次运行判定为 "error"（"没能验证" ≠ "验证通过"），stdout 里的任何数字都
+    不参与状态判定。
 
 安全边界：
     - 绝不修改真实 Repository（只写 TemporaryDirectory）。
@@ -20,13 +30,16 @@
 """
 
 import importlib.util
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -35,6 +48,26 @@ from integration_agent.validation.models import FailureDetail, TestResult
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_PYTEST_ARGS = ("-q", "-ra", "--tb=short")
+
+# runner-owned 插件：仓库里的单一来源 → 复制进工作区 → `-p` 注入。
+# 复制而不是 `-p integration_agent...`：子进程的 PYTHONPATH 只有工作区，插件能否
+# 加载不该取决于宿主包是以 editable 还是其它方式安装的（缺了它每次运行都会变成
+# "没有可信统计"，那是 fail-safe 但会让功能整体失效）。
+RUNNER_PLUGIN_SOURCE = "apiforge_runner_plugin.py"
+RUNNER_PLUGIN_MODULE = "apiforge_runner_plugin"
+RUNNER_STATS_FILENAME = ".apiforge-runner-stats.json"
+# 与插件里的 STATS_PATH_ENV_VAR 必须一致；test_runner 不 import 插件模块
+# （pytest 是 dev 依赖，生产 import 不能硬依赖它），一致性由测试钉住。
+RUNNER_STATS_ENV_VAR = "APIFORGE_RUNNER_STATS"
+
+# "退出码 0 但没有测试执行"的固定措辞：它是**运行结论**的一部分，所以做成常量，
+# 让下游（Repair Planner 的分类、报告、测试断言）不必各自复制这段中文/英文。
+NO_TESTS_EXECUTED_MESSAGE = "pytest exited successfully but no tests were executed"
+NO_TESTS_FAILURE_NAME = "<no tests executed>"
+
+# "pytest session 没有正常结束"（统计文件缺失/不可解析）的固定措辞。
+SESSION_NOT_COMPLETED_MESSAGE = "pytest session did not complete; result cannot be trusted"
+SESSION_NOT_COMPLETED_NAME = "<session not completed>"
 
 # 子进程环境 allowlist：**默认拒绝，明确放行**。
 #
@@ -67,15 +100,6 @@ SUBPROCESS_ENV_ALLOWLIST = (
     "LC_ALL",
     "LC_CTYPE",
 )
-
-# pytest 摘要行中的数量词 → TestResult 字段名（"1 error" / "2 errors" 同义）
-_SUMMARY_KEYS = {
-    "passed": "passed",
-    "failed": "failed",
-    "error": "errors",
-    "errors": "errors",
-    "skipped": "skipped",
-}
 
 
 @runtime_checkable
@@ -166,6 +190,9 @@ class DeterministicTestRunner:
                 dependency_warnings = self.dependency_preparer.prepare(artifacts.dependency_changes)
                 self._materialize(artifacts, workspace)
                 self._write_metadata(artifacts, workspace)
+                # 复制放在产物落地**之后**：工作区里这个文件名由 runner 独占，
+                # 生成产物无法抢占它（抢了也被覆盖）。
+                _install_runner_plugin(workspace)
                 return self._run_pytest(workspace, dependency_warnings)
         except Exception as exc:  # 环境级失败（如路径越界）统一转为 error 结果
             return TestResult(
@@ -198,7 +225,16 @@ class DeterministicTestRunner:
     def _run_pytest(self, workspace: Path, dependency_warnings: list[str]) -> TestResult:
         # 最小环境：不继承父进程环境，见 build_subprocess_env
         env = build_subprocess_env(workspace)
-        command = [sys.executable, "-m", "pytest", *self.pytest_args]
+        stats_path = workspace / RUNNER_STATS_FILENAME
+        env[RUNNER_STATS_ENV_VAR] = str(stats_path)
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            RUNNER_PLUGIN_MODULE,
+            *self.pytest_args,
+        ]
         start = time.monotonic()
         try:
             completed = subprocess.run(
@@ -229,10 +265,42 @@ class DeterministicTestRunner:
                 dependency_warnings=dependency_warnings,
             )
         duration = time.monotonic() - start
-        counts, summary_failures = _parse_summary(completed.stdout)
-        failure_details = _parse_failure_details(completed.stdout, summary_failures)
+        # stdout 只用来取失败详情（人看的部分），**不参与计数**：见模块级"信任边界"。
+        failure_details = _parse_failure_details(
+            completed.stdout, _parse_summary_failures(completed.stdout)
+        )
+        stats = _read_runner_stats(stats_path, exit_code=completed.returncode)
+        if stats is None:
+            # session 没有正常结束（os._exit / sys.exit / hook 之前崩溃），或写出的
+            # 统计与进程退出码对不上。这是"没能验证"，既不是通过也不是失败。
+            return TestResult(
+                status="error",
+                exit_code=completed.returncode,
+                duration=round(duration, 3),
+                stdout=completed.stdout,
+                stderr=_with_note(completed.stderr, SESSION_NOT_COMPLETED_MESSAGE),
+                failure_details=[
+                    FailureDetail(
+                        test_name=SESSION_NOT_COMPLETED_NAME,
+                        message=SESSION_NOT_COMPLETED_MESSAGE,
+                    ),
+                    *failure_details,
+                ],
+                dependency_warnings=dependency_warnings,
+            )
+        counts = stats.counts
+        status = _status_from_result(completed.returncode, counts)
+        if not failure_details:
+            # stdout 里读不到详情（被伪造、被截断）时用插件记录的 nodeid 兜底，
+            # 免得下游拿到一个没有失败详情的 failed。
+            failure_details = stats.as_details()
+        if status == "error" and completed.returncode == 0:
+            # 退出码成功、却一个测试都没执行：这是**假阳性**，必须留下可追溯的说明，
+            # 否则下游只看到一个没有失败详情的 error，无从判断是环境问题还是这次运行
+            # 根本没验证任何东西。
+            failure_details = [_no_tests_detail(counts)] + failure_details
         return TestResult(
-            status=_status_from_exit_code(completed.returncode),
+            status=status,
             exit_code=completed.returncode,
             passed=counts["passed"],
             failed=counts["failed"],
@@ -246,28 +314,107 @@ class DeterministicTestRunner:
         )
 
 
-# ------------------------------------------------------------------ 输出解析
+# ------------------------------------------- runner-owned 统计（唯一可信计数源）
 
 
-def _parse_summary(stdout: str) -> tuple[dict[str, int], list[tuple[str, str, str]]]:
-    """解析 pytest 数量统计（如 "3 passed, 1 skipped in 0.05s"）与 FAILED/ERROR 摘要行。"""
-    counts = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+@dataclass(frozen=True)
+class RunnerStats:
+    """runner-owned 插件写出的统计文件内容。
+
+    这是 TestResult 计数字段的**唯一**来源：它由插件在 ``pytest_sessionfinish``
+    里写出，因此只有在 pytest session 正常结束时才存在。
+    """
+
+    counts: dict[str, int]
+    collected: int
+    exit_status: int
+    failures: tuple[tuple[str, str], ...]  # (nodeid, 一行摘要)
+
+    def as_details(self) -> list[FailureDetail]:
+        """失败/错误测试 → FailureDetail（stdout 解析不到详情时的兜底）。"""
+        details: list[FailureDetail] = []
+        for nodeid, message in self.failures:
+            file_part, separator, name = nodeid.rpartition("::")
+            details.append(
+                FailureDetail(
+                    test_name=name if separator else nodeid,
+                    file=file_part or None,
+                    message=message,
+                )
+            )
+        return details
+
+
+def _install_runner_plugin(workspace: Path) -> None:
+    """把插件复制进工作区：`-p` 按模块名加载，而子进程的 sys.path 只有工作区。"""
+    shutil.copyfile(
+        Path(__file__).with_name(RUNNER_PLUGIN_SOURCE), workspace / RUNNER_PLUGIN_SOURCE
+    )
+
+
+def _int_field(payload: dict, name: str) -> int | None:
+    """非负整数才接受；bool 是 int 的子类，必须显式排除。"""
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _read_runner_stats(path: Path, *, exit_code: int) -> RunnerStats | None:
+    """读取 runner-owned 统计；缺失 / 格式不对 / 与退出码矛盾时返回 None。
+
+    返回 None 的语义是"这次运行没有可信结论"，调用方据此判 error。宁可少报一次
+    真实通过，也不能凭一份来路不明的文件宣布通过。exit_status 与进程退出码的
+    一致性检查是廉价的异常探测：不一致说明这份统计不代表这次运行。
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    counts: dict[str, int] = {}
+    for field in ("passed", "failed", "errors", "skipped"):
+        value = _int_field(payload, field)
+        if value is None:
+            return None
+        counts[field] = value
+    collected = _int_field(payload, "collected")
+    exit_status = _int_field(payload, "exit_status")
+    if collected is None or exit_status is None or exit_status != exit_code:
+        return None
+    failures: list[tuple[str, str]] = []
+    for entry in payload.get("failures") or ():
+        if not isinstance(entry, dict):
+            return None
+        nodeid, message = entry.get("nodeid"), entry.get("message")
+        if not isinstance(nodeid, str) or not isinstance(message, str):
+            return None
+        failures.append((nodeid, message))
+    return RunnerStats(
+        counts=counts, collected=collected, exit_status=exit_status, failures=tuple(failures)
+    )
+
+
+def _with_note(stderr: str, note: str) -> str:
+    """在子进程 stderr 后面追加一行结论说明（子进程输出本身不丢）。"""
+    return f"{stderr.rstrip()}\n{note}" if stderr.strip() else note
+
+
+# --------------------------------------------- 输出解析（仅用于失败详情与调试）
+
+
+def _parse_summary_failures(stdout: str) -> list[tuple[str, str, str]]:
+    """stdout 中的 FAILED/ERROR 摘要行。
+
+    **只用于失败详情与调试**：计数一律不从这里来（见模块级"信任边界"）。
+    """
     summary_failures: list[tuple[str, str, str]] = []
-    summary_line = None
-    for line in reversed(stdout.splitlines()):
-        if re.search(r"in\s+[\d.]+s\s*$", line):
-            summary_line = line
-            break
-    if summary_line:
-        for match in re.finditer(r"(\d+)\s+(\w+)", summary_line):
-            key = _SUMMARY_KEYS.get(match.group(2))
-            if key:
-                counts[key] = int(match.group(1))
     for line in stdout.splitlines():
         matched = re.match(r"^(FAILED|ERROR)\s+(.+?)\s+-\s+(.*)$", line)
         if matched:
             summary_failures.append((matched.group(1), matched.group(2), matched.group(3)))
-    return counts, summary_failures
+    return summary_failures
 
 
 _SUMMARY_ENTRY = re.compile(r"^(FAILED|ERROR|SKIPPED|PASSED|XFAILED|XPASSED|DESELECTED)\s")
@@ -334,9 +481,32 @@ def _parse_failure_details(
     return details
 
 
-def _status_from_exit_code(exit_code: int | None) -> str:
+def _no_tests_detail(counts: dict[str, int]) -> FailureDetail:
+    """「退出码 0 但没执行任何测试」的结构化说明。"""
+    executed = counts["passed"] + counts["failed"]
+    detail = NO_TESTS_EXECUTED_MESSAGE
+    if executed == 0 and counts["skipped"] > 0:
+        detail += f"（{counts['skipped']} 个测试被跳过，跳过的测试不算执行）"
+    return FailureDetail(test_name=NO_TESTS_FAILURE_NAME, message=detail)
+
+
+def _status_from_result(exit_code: int, counts: dict[str, int]) -> str:
+    """(退出码, 数量统计) → TestResult.status。
+
+    只看退出码是不够的：pytest 在**一个测试都没真正执行**时也可能返回 0
+    （收集被 conftest 清空、全部用例被跳过、`--collect-only` 之类）。
+    那种情况报 "passed" 是假阳性——下游（Repair Loop）会据此直接判定集成成功，
+    交付一份从未被验证过的代码。**"没能验证" 不等于 "验证通过"**。
+
+    所以 "passed" 要求三件事同时成立：退出码为 0、**至少有测试通过**（passed > 0）、
+    且没有失败与错误。skipped 不计入执行：全部跳过的运行同样什么都没验证。
+
+    "error" 而不是 "failed"：这不是"代码有问题"，是"这次运行没有证据"。
+    """
     if exit_code == 0:
-        return "passed"
+        if counts["passed"] > 0 and counts["failed"] == 0 and counts["errors"] == 0:
+            return "passed"
+        return "error"
     if exit_code == 1:  # 存在失败/错误的测试
         return "failed"
     return "error"  # 2/3/4/5：中断、内部错误、用法错误、未收集到测试

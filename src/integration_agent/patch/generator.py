@@ -31,6 +31,12 @@ DEFAULT_MAX_TOTAL_DIFF_CHARS = 2_000_000  # unified_diff 总量上限
 
 _WINDOWS_ABSOLUTE = re.compile(r"^[a-zA-Z]:")
 
+# 控制字符（含 \n \r \t 与 DEL）。路径会出现在 `diff --git a/... b/...`、
+# `--- a/...`、`+++ b/...` 这三处的**行首**位置：带换行的路径会让这一行提前结束，
+# 剩下的文本就变成攻击者可控的 diff 正文（足以塞进额外 hunk 或整段文件头）。
+# 控制字符在路径里没有正当用途，直接拒绝。
+_PATH_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
 
 @runtime_checkable
 class PatchGenerator(Protocol):
@@ -93,7 +99,8 @@ class DeterministicPatchGenerator:
                 total_diff_chars += len(patch_file.diff)
             files.append(patch_file)
 
-        unified_diff = "\n".join(item.diff for item in files if item.diff)
+        # 每段 diff 都已自带行尾换行，直接拼接；再 join("\n") 会在文件之间插入空行
+        unified_diff = "".join(item.diff for item in files if item.diff)
         created = sum(1 for item in files if item.action == "create")
         modified = len(files) - created
         return PatchResult(
@@ -187,31 +194,71 @@ class DeterministicPatchGenerator:
 
 
 def _render_create_diff(path: str, new_text: str) -> str:
-    """create 文件的 unified diff：标准 --- /dev/null +++ b/path 头 + 全部新增行。
+    """create 文件的 unified diff：标准 --- /dev/null +++ b/path 头 + 新增行。
 
-    不用 difflib：空内容时 difflib 不产出标准头，这里手写渲染保证格式稳定。
+    手写"头 + 每行加个 +"是不行的：unified diff 的 hunk 必须带 ``@@ -0,0 +1,N @@``，
+    漏掉它产出的就不是 unified diff，`git apply` 会直接拒绝（而不是宽容地忽略）。
+    交给 difflib：从空序列推到 N 行时它给出的 hunk 头本来就是正确的。
+
+    空文件是唯一需要特判的情况，而且**不是因为 difflib 不给头**——是 unified diff
+    根本表示不了"创建一个空文件"：一个 hunk 至少要有一行正文（``@@ -0,0 +1,0 @@``
+    与 ``@@ -0,0 +0,0 @@`` 都被 git 判为 corrupt），只给 ``--- /dev/null`` / ``+++``
+    两个头则被 git 判为 "No valid patches in input"。
+    所以空文件用 git 自己产出的那种形式（``diff --git`` + ``new file mode``），
+    并保留 --- /dev/null 与 +++ 两个头，让两种 create 的 diff 长得一致。
     """
-    lines = ["--- /dev/null", f"+++ b/{path}"]
-    lines.extend(f"+{line}" for line in new_text.splitlines())
-    return "\n".join(lines) + "\n"
+    if not new_text:
+        return f"diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+    return _render_diff("/dev/null", f"b/{path}", "", new_text)
 
 
 def _render_diff(from_label: str, to_label: str, old_text: str, new_text: str) -> str:
-    """modify 文件的 unified diff：标准库 difflib。"""
-    lines = difflib.unified_diff(
-        old_text.splitlines(),
-        new_text.splitlines(),
-        fromfile=from_label,
-        tofile=to_label,
-        lineterm="\n",
+    """unified diff：标准库 difflib，输出保证能被 `git apply` 接受。
+
+    ``keepends=True`` 是必需的：行尾换行必须留在行内容里，否则"文件末尾没有换行符"
+    与"末尾有换行符"两种文件会 diff 成同一个结果，而 git 认为它们是不同的文件。
+    ``lineterm="\\n"`` 让控制行（``---`` / ``+++`` / ``@@``）自己带上换行，
+    于是**每个分块都是自洽的一行**，拼接时不需要再猜哪里该补换行。
+    """
+    chunks = list(
+        difflib.unified_diff(
+            old_text.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
+            fromfile=from_label,
+            tofile=to_label,
+            lineterm="\n",
+        )
     )
-    return "\n".join(lines) + ("\n" if lines else "")
+    return _join_diff_chunks(chunks)
+
+
+def _join_diff_chunks(chunks: list[str]) -> str:
+    """把 difflib 的分块拼成 unified diff 文本。
+
+    分块只有两类：控制行（自带换行）与正文行（keepends=True，自带换行）。
+    因此**唯一不带换行的分块，就是"文件末尾没有换行符"的那一行**——不需要按前缀
+    猜哪块是控制行（那样会把内容为 ``-- x`` 的删除行误判成文件头）。
+
+    这种行后面必须跟一条 ``\\ No newline at end of file`` 标记（git 的格式要求）：
+    缺了它，下一段 hunk 头会被当成这一行的内容，整个 patch 作废。difflib 不会加，
+    这里补上。标记行本身也是 patch 的一部分，所以只补一次。
+    """
+    output: list[str] = []
+    for chunk in chunks:
+        output.append(chunk)
+        if not chunk.endswith("\n"):
+            output.append("\n\\ No newline at end of file\n")
+    return "".join(output)
 
 
 def _validate_path(path: str) -> str | None:
     """校验 path 为安全相对路径；返回错误描述，合法时返回 None。"""
     if not path or not path.strip():
         return f"path 为空：{path!r}"
+    if _PATH_CONTROL.search(path):
+        # 路径不是"内容"而是 diff 的**结构**：换行能让它从路径头里逃出来，
+        # 后续文本就成了攻击者书写的 hunk（见 _PATH_CONTROL 注释）。
+        return f"path 含控制字符：{path!r}"
     normalized = path.replace("\\", "/")
     if normalized.startswith("/"):
         return f"path 不能是绝对路径：{path!r}"

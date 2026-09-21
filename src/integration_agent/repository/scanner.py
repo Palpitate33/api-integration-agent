@@ -109,7 +109,13 @@ def scan_repository(
 def iter_python_files(
     root: str | Path, *, ignored_dirs: Collection[str] = DEFAULT_IGNORED_DIRS
 ) -> Iterator[Path]:
-    """按稳定顺序遍历项目中的 .py 文件（绝对路径），跳过忽略目录与 *.egg-info。"""
+    """按稳定顺序遍历项目中的 .py 文件（绝对路径），跳过忽略目录与 *.egg-info。
+
+    ``followlinks=False`` 只挡住"顺着 symlink **目录**往下走"，**挡不住 symlink
+    文件**：名字以 .py 结尾的链接照样会被列出来。所以这个函数只负责"列出候选"，
+    凡是**要读内容**的调用方都必须再走一次 resolve_inside_project——
+    ``link.stat()`` / ``link.read_text()`` 都会跟随链接，读到 root 外面去。
+    """
     root = Path(root)
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(
@@ -118,6 +124,26 @@ def iter_python_files(
         for filename in sorted(filenames):
             if filename.endswith(".py"):
                 yield Path(dirpath) / filename
+
+
+def resolve_inside_project(root: str | Path, candidate: str | Path) -> Path | None:
+    """候选路径 → 项目内的真实路径；解析后落在 root 之外时返回 None。
+
+    这是"读取项目内文件"的统一边界判据，与 read_file 工具用的是同一条：
+    **先 resolve，再判包含关系**。顺序不能反——symlink / junction 只有在 resolve
+    之后才现出原形，直接比较链接自身的路径永远得到"在项目内"。
+
+    root 必须已经是真实路径（``validate_project_root`` 保证这一点），
+    否则两边一个 resolve 过一个没 resolve，比较没有意义。
+
+    返回 None 而不是抛异常：调用方的语义是"这个候选不可用，跳过"，
+    与"文件不可读"是同一种处理。断链、权限不足、链接成环等 OSError 同样返回 None。
+    """
+    try:
+        resolved = Path(candidate).resolve()
+    except OSError:  # 断链 / 权限不足 / 链接成环
+        return None
+    return resolved if resolved.is_relative_to(Path(root)) else None
 
 
 def validate_project_root(root: str | Path) -> Path:
