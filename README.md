@@ -49,7 +49,7 @@ An AI software engineering agent that turns a third-party OpenAPI specification 
 | **LLM Repair** | `integration_agent.repair` | `StructuredLLMRepairApplier` 通过 `DeepSeekLLMClient` 让 LLM 生成具体代码修改（严格 JSON + Pydantic 校验） |
 | **Final Patch / Diff** | `integration_agent.patch` | 纯函数，把最终产物转成可审计的 `PatchResult` 与真实 unified diff |
 | **Execution Trace** | `integration_agent.trace` | 内存 `TraceCollector` 记录全程结构化事件（脱敏、限长、不写盘），驱动 CLI 展示 |
-| **Benchmark** | `integration_agent.benchmark` | 真实跑 Pipeline 的离线确定性基准，4 个固定 case + 动态指标 |
+| **Pipeline Consistency Benchmark** | `integration_agent.benchmark` | 真实跑 Pipeline 的离线确定性基准，4 个固定 case + 动态指标；测的是工程闭环自洽，不是集成质量 |
 | **CLI Demo / Benchmark** | `integration_agent.cli` | `python -m integration_agent demo` / `benchmark`，纯标准库 |
 
 ---
@@ -302,9 +302,20 @@ python -m integration_agent demo --no-color   # 关闭 ANSI 颜色（管道 / CI
 
 ---
 
-## Benchmark
+## Pipeline Consistency Benchmark
 
-用真实 Pipeline 运行量化 APIForge 的确定性工程闭环：
+这个 Benchmark 用**真实 Pipeline** 反复跑同一批离线 case，检验的是 APIForge 这条确定性工程闭环**自身**是否自洽：
+
+| 它验证什么 | 怎么验证 |
+|---|---|
+| 确定性执行 | 同一个 case 连续跑两次，结构化结果必须逐项一致（`deterministic_repeat`） |
+| Pipeline 一致性 | 同一份输入走完 Planning → Generation → Patch → Test Runner，得到同样的产物与同样的计数 |
+| 基于 trace 的指标 | 每个数字都从 `BenchmarkResult` 与 execution trace 现场算出，代码里没有任何写死的成功率 |
+| 预期失败的处理 | 注入确定性错误后测试**真的**失败，流程如实记录，而不是把它粉饰成通过（`petstore_sabotage`） |
+| 修复无进展的诚实性 | Repair 真尝试；真无进展时如实报 `no_progress`，不伪造修复过程 |
+| 可重复性 | 换进程、换 `PYTHONHASHSEED` 都得到同样的比率与计数（耗时是墙钟时间，随机器波动） |
+
+**它不衡量什么**：API 集成质量、Agent 的修复能力、LLM 路径的效果。这四个 case 全部离线、不联网、不调 LLM，样本量小且是刻意挑选的，下面的百分比**不是**集成成功率，也**不是** Agent 的修复成功率。
 
 ```bash
 python -m integration_agent benchmark
@@ -339,6 +350,8 @@ deterministic_repeat     PASSED
 
 当前结果：**4 个确定性 case / 5 次真实 Pipeline 执行**，3 passed / 1 failed / 0 errors，pass rate 75.0%，repair trigger rate 25.0%，repair recovery rate 0.0%，平均修复次数 0.25，平均耗时约 0.5s（墙钟时间，随机器波动；上面的比率与计数是确定性值，反复运行不变）。
 
+> 输出里的 `Pass rate` / `Repair trigger rate` / `Repair recovery rate` 都是**case 层面的比率**——这几条 case 里有多少条跑绿了、失败的那条有没有触发 Repair、有没有被修好。它们不是 API 集成成功率，也不代表 Agent 的修复能力：`petstore_sabotage` 里的错误是**故意注入**的，它贡献的那个 0% 恰恰是"如实报告失败"这一设计目标被达成的证据。
+>
 > These metrics are from the current four deterministic local benchmark cases and are not intended to represent general API integration success rates. 它们测量的是确定性工程闭环（不联网、不调 LLM），且全部指标从 `BenchmarkResult` 动态计算，代码里没有任何写死的成功率。
 
 | case | 内容 |
@@ -435,7 +448,7 @@ uv run python -m integration_agent demo              # 离线确定性闭环
 uv run python -m integration_agent demo --sabotage   # 真实失败 → Repair Loop → 失败收尾
 ```
 
-### Benchmark：量化指标
+### Pipeline Consistency Benchmark：量化指标
 
 ```powershell
 uv run python -m integration_agent benchmark
@@ -625,7 +638,8 @@ TestRunner 在 `TemporaryDirectory` 中重建工作区后执行 pytest：真实�
 - **Demo Mode 是演示机制，不是生产功能**：故障注入的唯一目的是让"失败 → 修复"闭环在演示中稳定复现，它不参与任何正常请求。
 - **TestRunner 只运行生成的测试**：不跑目标仓库原有的完整测试套件，"集成正确"的判定范围限于生成产物自身的行为。
 - **Repository Understanding 是关键词检索**：不是向量检索，也没有调用图/依赖图分析。
-- **Benchmark 测量的是确定性闭环**：4 个 case 全部离线、不调 LLM，指标不代表一般 API 集成的成功率，也不覆盖 LLM 路径的质量。
+- **既有业务代码的复用靠子串匹配**：Planner 从 API 名称与 tag 提取领域关键词（通常是复数，如 `users` / `posts`），再到仓库里做**子串**检索；模块里写的是单数（`user` / `profile`）就命中不了。没有命中就没有 `files_to_modify` 条目，`examples/demo_project/service.py` 因此始终只被扫描、不被修改——`IntegrationPlan.files_to_modify` → Code Generator 的 `modify` 产物这条契约是通的，缺的是"什么样的模块算与本次集成相关"的判定规则。
+- **Pipeline Consistency Benchmark 测量的是确定性闭环**：4 个 case 全部离线、不调 LLM，输出的比率都是 case 层面的（几条 case 跑绿、失败的那条有没有被修好），不代表一般 API 集成的成功率，也不代表 Agent 的修复能力，同样不覆盖 LLM 路径的质量。
 - **尚无并发与缓存**：Pipeline 是单次同步执行，没有任务队列、持久化或重试调度。
 
 ---

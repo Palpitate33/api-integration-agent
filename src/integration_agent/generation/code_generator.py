@@ -44,7 +44,7 @@ from integration_agent.agent import (
     PlannedEndpoint,
     TestSpec,
 )
-from integration_agent.api import APIEndpoint, APIResponse
+from integration_agent.api import APIEndpoint, APIParameter, APIResponse
 from integration_agent.generation.models import (
     DependencyChange,
     GeneratedArtifacts,
@@ -746,7 +746,7 @@ class DeterministicCodeGenerator:
         auth = plan.authentication
         retryable_rules = [r for r in plan.error_handling.rules if r.retryable]
         first = plan.endpoints[0]
-        call_args, _ = _test_call_args(first.endpoint)
+        call_args, expected_path = _test_call_args(first.endpoint)
         call_name = _endpoint_name(first.endpoint)
         needs_base64 = auth is not None and auth.scheme == "http-basic"
 
@@ -778,7 +778,9 @@ class DeterministicCodeGenerator:
             "",
             "    def handler(request: httpx.Request) -> httpx.Response:",
             f"        assert request.method == {string_literal(first.endpoint.method)}",
-            f"        assert request.url.path == {string_literal(first.endpoint.path)}",
+            # 断言的是**替换后的**路径：path 参数已由客户端填进 URL，
+            # 拿模板原文来比永远比不中。
+            f"        assert request.url.path == {string_literal(expected_path)}",
             "        " + _dummy_response(first.endpoint),
             "",
             f"    client = {class_name}(",
@@ -821,7 +823,9 @@ class DeterministicCodeGenerator:
                 "        transport=httpx.MockTransport(handler),",
                 "    )",
                 f"    with pytest.raises({rate_limit}):",
-                f"        client.{call_name}()",
+                # 与其余调用点同一份参数列表：不带参数地调用一个需要 path 参数的方法，
+                # 抛出来的是 TypeError，永远不会是这里要断言的那个限流异常。
+                "        " + _call_expr(call_name, call_args),
             ]
         return "\n".join(lines) + "\n"
 
@@ -1242,16 +1246,35 @@ def _auth_assert_lines(auth: AuthenticationPlan) -> list[str]:
     return ['assert request.headers.get("Authorization") == "Bearer test-token"']
 
 
+def _path_arg_value(param: APIParameter, index: int) -> tuple[str, str]:
+    """path 参数的测试取值 → (调用里写的字面量, 期望 URL 里的字符串形式)。
+
+    按声明的 schema 类型取值：把声明为 ``integer`` 的路径参数写成 ``"test-1"``，
+    生成出来的测试在自己写下的类型注解下就不成立。schema_type 是外部文本，
+    所以只做"是不是数值类型"这一个分支，其余一律当字符串。
+    """
+    if param.schema_type in ("integer", "number"):
+        literal = str(index + 1)
+        return literal, literal
+    literal = f"test-{index + 1}"
+    return repr(literal), literal
+
+
 def _test_call_args(endpoint: APIEndpoint) -> tuple[list[str], str]:
-    """生成测试中对端点方法的调用参数，并返回参数替换后的期望路径。"""
+    """生成测试中对端点方法的调用参数，并返回参数替换后的期望路径。
+
+    这是"测试如何调用客户端"的唯一出处：签名里的每个参数都必须在这里被传一次，
+    path 参数还必须同时体现到期望路径上——否则测试断言的 URL 与客户端真正发出的
+    URL 就不是同一个东西（`{user_id}` 是模板，不是最终路径）。
+    """
     arg_names = _param_arg_names(endpoint)
     args: list[str] = []
     expected_path = endpoint.path
     for index, param in enumerate(endpoint.parameters):
         arg = arg_names[index]
         if param.location == "path":
-            value = f"test-{index + 1}"
-            args.append(f"{arg}={value!r}")
+            literal, value = _path_arg_value(param, index)
+            args.append(f"{arg}={literal}")
             expected_path = expected_path.replace("{" + param.name + "}", value)
         elif param.location == "query":
             args.append(f"{arg}=10")
@@ -1266,10 +1289,20 @@ def _test_call_args(endpoint: APIEndpoint) -> tuple[list[str], str]:
     return args, expected_path
 
 
-def _call_line(name: str, call_args: list[str]) -> str:
+def _call_expr(name: str, call_args: list[str]) -> str:
+    """`client.<method>(...)` 调用表达式——参数列表只在这一处拼装。
+
+    调用点有四处（单元测试 / 端到端 / 认证 / 重试），其中重试测试在 ``with`` 块内、
+    不要返回值。任何一处自己拼 ``client.x()`` 都会漏掉参数，所以参数拼装与缩进
+    分开：表达式统一走这里，缩进由调用方决定。
+    """
     if call_args:
-        return f"    result = client.{name}({', '.join(call_args)})"
-    return f"    result = client.{name}()"
+        return f"client.{name}({', '.join(call_args)})"
+    return f"client.{name}()"
+
+
+def _call_line(name: str, call_args: list[str], indent: str = "    ") -> str:
+    return f"{indent}result = {_call_expr(name, call_args)}"
 
 
 def _dummy_response(endpoint: APIEndpoint) -> str:

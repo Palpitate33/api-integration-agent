@@ -12,6 +12,7 @@
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,11 @@ from integration_agent.api.schema import (
     APIParameter,
     APIRequestBody,
     APIResponse,
+    normalize_schema_types,
 )
+
+# path 模板里的参数占位符：`/users/{user_id}/posts/{post_id}` → user_id / post_id
+_PATH_TEMPLATE_PARAMETER = re.compile(r"\{([^{}]+)\}")
 
 # 必须是有序序列：set 的迭代顺序随字符串哈希种子变化，会导致同一份文档
 # 在不同进程解析出不同的端点顺序。此处按 OpenAPI Path Item 的字段顺序排列。
@@ -181,6 +186,8 @@ def _build_endpoint(
         operation.get("parameters"), spec, context=f"{method} {path}"
     )
     merged.update({(param.name, param.location): param for param in operation_parameters})
+    parameters = list(merged.values())
+    parameters.extend(_undeclared_path_parameters(path, parameters))
 
     tags = operation.get("tags")
     return APIEndpoint(
@@ -190,7 +197,7 @@ def _build_endpoint(
         summary=operation.get("summary"),
         description=operation.get("description"),
         tags=tags if isinstance(tags, list) else [],
-        parameters=list(merged.values()),
+        parameters=parameters,
         request_body=_build_request_body(
             operation.get("requestBody"), spec, context=f"{method} {path}"
         ),
@@ -199,6 +206,31 @@ def _build_endpoint(
             for status, resp in responses_raw.items()
         ],
     )
+
+
+def _undeclared_path_parameters(path: str, declared: list[APIParameter]) -> list[APIParameter]:
+    """补上 path 模板里出现、但 ``parameters`` 中未声明的路径参数。
+
+    OpenAPI 要求 path 参数必须显式声明，但真实文档经常漏写。漏写时 `{user_id}`
+    不会被任何一层替换：生成的客户端把字面量 ``{user_id}`` 发出去，而生成的测试
+    又按"这个端点有参数"来构造调用——两边对不上。模板本身是这段契约唯一的事实
+    来源，所以以模板为准补齐；没有声明就没有类型可推断，按 string 处理。
+
+    按模板出现顺序追加在已声明参数之后，保证同一份文档的解析结果稳定。
+    """
+    known = {param.name for param in declared if param.location == "path"}
+    return [
+        APIParameter(
+            name=name,
+            location="path",
+            required=True,
+            description="由 path 模板推导：OpenAPI 未显式声明该路径参数",
+            schema_type="string",
+            schema_types=["string"],
+        )
+        for name in dict.fromkeys(_PATH_TEMPLATE_PARAMETER.findall(path))
+        if name not in known
+    ]
 
 
 def _extract_parameters(params: Any, spec: dict[str, Any], *, context: str) -> list[APIParameter]:
@@ -220,13 +252,15 @@ def _extract_parameters(params: Any, spec: dict[str, Any], *, context: str) -> l
         if not isinstance(name, str) or not isinstance(location, str):
             raise OpenAPISpecError(f"{context}: 参数缺少 'name' 或 'in' 字段")
         schema = entry.get("schema") if isinstance(entry.get("schema"), dict) else {}
+        schema_type, schema_types = normalize_schema_types(schema.get("type"))
         result.append(
             APIParameter(
                 name=name,
                 location=location,
                 required=bool(entry.get("required", False)),
                 description=entry.get("description"),
-                schema_type=schema.get("type"),
+                schema_type=schema_type,
+                schema_types=schema_types,
                 schema_format=schema.get("format"),
                 default=schema.get("default"),
                 enum=schema.get("enum"),
@@ -246,12 +280,15 @@ def _build_request_body(body: Any, spec: dict[str, Any], *, context: str) -> API
         if not isinstance(body, dict):
             raise OpenAPISpecError(f"{context}: 无法解析 requestBody 引用")
     content_type, media = _pick_media(body.get("content"))
-    schema_type, schema_ref, schema = _extract_schema(media.get("schema") if media else None)
+    schema_type, schema_types, schema_ref, schema = _extract_schema(
+        media.get("schema") if media else None
+    )
     return APIRequestBody(
         required=bool(body.get("required", False)),
         description=body.get("description"),
         content_type=content_type,
         schema_type=schema_type,
+        schema_types=schema_types,
         schema_ref=schema_ref,
         json_schema=schema,
     )
@@ -266,12 +303,15 @@ def _build_response(status: Any, resp: Any, spec: dict[str, Any], *, context: st
         if not isinstance(resp, dict):
             raise OpenAPISpecError(f"{context}: 无法解析响应 {status!r} 的引用")
     content_type, media = _pick_media(resp.get("content"))
-    schema_type, schema_ref, schema = _extract_schema(media.get("schema") if media else None)
+    schema_type, schema_types, schema_ref, schema = _extract_schema(
+        media.get("schema") if media else None
+    )
     return APIResponse(
         status_code=str(status),
         description=resp.get("description"),
         content_type=content_type,
         schema_type=schema_type,
+        schema_types=schema_types,
         schema_ref=schema_ref,
         json_schema=schema,
     )
@@ -288,14 +328,14 @@ def _pick_media(content: Any) -> tuple[str | None, dict | None]:
     return first_type, media if isinstance(media, dict) else None
 
 
-def _extract_schema(schema: Any) -> tuple[str | None, str | None, dict | None]:
-    """提取 schema 的简化信息：返回 (顶层类型, $ref 名称, 原始 schema)。"""
+def _extract_schema(schema: Any) -> tuple[str | None, list[str], str | None, dict | None]:
+    """提取 schema 的简化信息：返回 (顶层类型, 类型集合, $ref 名称, 原始 schema)。"""
     if not isinstance(schema, dict):
-        return None, None, None
+        return None, [], None, None
     ref = schema.get("$ref")
     ref_name = ref.rsplit("/", 1)[-1] if isinstance(ref, str) and ref else None
-    schema_type = schema.get("type")
-    return (schema_type if isinstance(schema_type, str) else None), ref_name, schema
+    schema_type, schema_types = normalize_schema_types(schema.get("type"))
+    return schema_type, schema_types, ref_name, schema
 
 
 def _extract_auth(spec: dict[str, Any]) -> APIAuth | None:

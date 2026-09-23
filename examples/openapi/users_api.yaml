@@ -1,0 +1,128 @@
+openapi: 3.0.3
+info:
+  title: Demo Users API
+  version: 1.0.0
+  description: >-
+    A minimal OpenAPI fixture whose endpoints are *all* built on path
+    parameters. It exists to pin the generation contract between the OpenAPI
+    path template, the IntegrationPlan, the generated client method signature
+    and the invocation inside the generated tests.
+servers:
+  - url: https://users.example.com/v1
+paths:
+  /users/{user_id}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        description: ID of the user
+        schema:
+          type: string
+    get:
+      operationId: getUser
+      summary: Get a user by ID
+      description: Returns a single user addressed by its path parameter.
+      tags: [users]
+      responses:
+        "200":
+          description: A single user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: User not found
+    post:
+      operationId: updateUser
+      summary: Update a user
+      description: Replaces the user identified by the path parameter.
+      tags: [users]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/User"
+      responses:
+        "200":
+          description: The updated user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+  /users/{user_id}/posts:
+    get:
+      operationId: listUserPosts
+      summary: List the posts of a user
+      description: Mixes a path parameter with an optional query parameter.
+      tags: [posts]
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          description: ID of the user
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Maximum number of posts to return
+          schema:
+            type: integer
+            format: int32
+      responses:
+        "200":
+          description: A list of posts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Post"
+  /users/{user_id}/posts/{post_id}:
+    get:
+      operationId: getUserPost
+      summary: Get one post of a user
+      description: Two path parameters in a single template.
+      tags: [posts]
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          description: ID of the user
+          schema:
+            type: string
+        - name: post_id
+          in: path
+          required: true
+          description: ID of the post
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A single post
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Post"
+components:
+  schemas:
+    User:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+    Post:
+      type: object
+      required: [id, title]
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        body:
+          type: string

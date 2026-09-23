@@ -13,8 +13,9 @@
     - 输出结构化对象（相对 POSIX 路径、固定忽略规则），便于按需裁剪后再交给 LLM。
 """
 
+import logging
 import os
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -62,6 +63,29 @@ MANIFEST_FILES = (
 SOURCE_DIR_CANDIDATES = ("src", "lib")
 TEST_DIR_CANDIDATES = ("tests", "test")
 
+logger = logging.getLogger(__name__)
+
+
+def _default_walk_error(error: OSError) -> None:
+    """``os.walk`` 遍历失败的默认处理：记一条 warning，然后跳过该目录。
+
+    ``os.walk`` 的 ``onerror`` 缺省值是 ``None``，此时它**静默**丢弃错误——真正的
+    问题不是"抛异常"，而是"扫描结果悄悄少了几个目录，调用方却以为看到了全部"。
+    所以这里显式接住：记下来，并把"少了什么"变成结构化字段（skipped_paths）。
+    """
+    logger.warning("扫描时跳过不可访问的路径：%s", error.filename or error)
+
+
+def _relative_label(root: Path, filename: str | None) -> str:
+    """把失败路径转成相对 root 的 POSIX 路径；做不到就退回原样。"""
+    if not filename:
+        return "<未知路径>"
+    candidate = Path(filename)
+    try:
+        return candidate.relative_to(root).as_posix()
+    except ValueError:
+        return candidate.as_posix()
+
 
 class RepositoryError(ValueError):
     """仓库扫描或代码搜索失败时抛出。"""
@@ -78,16 +102,31 @@ class ProjectStructure(BaseModel):
     test_dirs: list[str] = Field(default_factory=list)  # tests / test
     dependencies: list[str] = Field(default_factory=list)  # pyproject + requirements 声明的依赖
     python_files: list[str] = Field(default_factory=list)  # 全部 .py 文件（已忽略无关目录）
+    # 因权限等原因被跳过的目录（相对 root 的 POSIX 路径，已排序去重）。
+    # 空列表 = 扫描到了全部内容；非空 = 这份快照是不完整的，调用方应当知情。
+    skipped_paths: list[str] = Field(default_factory=list)
 
 
 def scan_repository(
     root: str | Path, *, ignored_dirs: Collection[str] = DEFAULT_IGNORED_DIRS
 ) -> ProjectStructure:
-    """扫描项目目录并返回结构快照；目录不存在或不是目录时抛出 RepositoryError。"""
+    """扫描项目目录并返回结构快照；目录不存在或不是目录时抛出 RepositoryError。
+
+    不可访问的目录（权限不足、扫描途中消失等）被**跳过并记录**，不会中断整次扫描：
+    Repository Understanding 断在一个子目录上，代价是整个 Pipeline 拿不到任何仓库
+    上下文，而这个子目录通常与本次集成无关。跳过是"文件系统层面读不到"这一类预期
+    失败的处理，其它异常（例如遍历器自身的 bug）照旧向上抛，不在这里被吞掉。
+    """
     path = validate_project_root(root)
+    skipped: list[str] = []
+
+    def on_error(error: OSError) -> None:
+        _default_walk_error(error)
+        skipped.append(_relative_label(path, error.filename))
+
     python_files = [
         file.relative_to(path).as_posix()
-        for file in iter_python_files(path, ignored_dirs=ignored_dirs)
+        for file in iter_python_files(path, ignored_dirs=ignored_dirs, on_error=on_error)
     ]
     manifest_files = [name for name in MANIFEST_FILES if (path / name).is_file()]
 
@@ -99,15 +138,19 @@ def scan_repository(
         name=name or path.name,
         is_python_project=bool(manifest_files or python_files),
         manifest_files=manifest_files,
-        source_dirs=_detect_source_dirs(path, ignored_dirs=ignored_dirs),
+        source_dirs=_detect_source_dirs(path, ignored_dirs=ignored_dirs, on_error=on_error),
         test_dirs=[name for name in TEST_DIR_CANDIDATES if (path / name).is_dir()],
         dependencies=dependencies,
         python_files=python_files,
+        skipped_paths=sorted(set(skipped)),
     )
 
 
 def iter_python_files(
-    root: str | Path, *, ignored_dirs: Collection[str] = DEFAULT_IGNORED_DIRS
+    root: str | Path,
+    *,
+    ignored_dirs: Collection[str] = DEFAULT_IGNORED_DIRS,
+    on_error: Callable[[OSError], None] | None = None,
 ) -> Iterator[Path]:
     """按稳定顺序遍历项目中的 .py 文件（绝对路径），跳过忽略目录与 *.egg-info。
 
@@ -115,9 +158,15 @@ def iter_python_files(
     文件**：名字以 .py 结尾的链接照样会被列出来。所以这个函数只负责"列出候选"，
     凡是**要读内容**的调用方都必须再走一次 resolve_inside_project——
     ``link.stat()`` / ``link.read_text()`` 都会跟随链接，读到 root 外面去。
+
+    ``on_error`` 处理遍历时的 ``OSError``（权限不足、目录在扫描途中消失等），随后
+    跳过该项继续遍历。缺省行为是记一条 warning 而不是静默丢弃：``os.walk`` 自己
+    的缺省（``onerror=None``）会把错误完全吃掉，"扫描结果悄悄变少"比报错更难查。
+    只有 ``OSError`` 会走到这里——其它异常仍然是 bug，继续向上抛。
     """
     root = Path(root)
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    handler = on_error if on_error is not None else _default_walk_error
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=handler):
         dirnames[:] = sorted(
             name for name in dirnames if name not in ignored_dirs and not name.endswith(".egg-info")
         )
@@ -156,12 +205,22 @@ def validate_project_root(root: str | Path) -> Path:
     return path.resolve()
 
 
-def _detect_source_dirs(root: Path, *, ignored_dirs: Collection[str]) -> list[str]:
-    """识别源码目录：src/lib 等约定名，以及根目录下含 __init__.py 的包目录。"""
+def _detect_source_dirs(
+    root: Path,
+    *,
+    ignored_dirs: Collection[str],
+    on_error: Callable[[OSError], None] | None = None,
+) -> list[str]:
+    """识别源码目录：src/lib 等约定名，以及根目录下含 __init__.py 的包目录。
+
+    根目录不可读时降级为"仅按约定名判断"，并把这个事实交给 ``on_error`` 记录。
+    """
     found = {name for name in SOURCE_DIR_CANDIDATES if (root / name).is_dir()}
     try:
         children = sorted(root.iterdir())
-    except OSError:  # pragma: no cover - 目录不可读时降级为仅按约定名判断
+    except OSError as error:  # 目录不可读：降级为仅按约定名判断
+        if on_error is not None:
+            on_error(error)
         children = []
     for child in children:
         if not child.is_dir() or child.name in ignored_dirs:

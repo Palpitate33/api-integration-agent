@@ -292,6 +292,14 @@ def _render_project(project: ProjectStructure) -> tuple[list[str], bool]:
         f"name: {project.name}",
         f"is_python_project: {project.is_python_project}",
     ]
+    if project.skipped_paths:
+        # 只在真的跳过过东西时才出现：这一节是"你看到的快照不完整"的提示，
+        # 平时不占预算，出现时必须在模型下判断之前就摆在它眼前。
+        section, cut = _render_section(
+            "skipped_inaccessible", project.skipped_paths, MAX_INSPECT_DEPENDENCIES
+        )
+        blocks.append(section)
+        truncated = truncated or cut
     for label, values, cap in (
         ("manifest_files", project.manifest_files, MAX_INSPECT_DEPENDENCIES),
         ("source_dirs", project.source_dirs, MAX_INSPECT_DEPENDENCIES),
