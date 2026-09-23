@@ -13,6 +13,7 @@
 """
 
 import re
+import time
 from typing import Protocol, runtime_checkable
 
 from integration_agent.agent.models import (
@@ -34,6 +35,7 @@ from integration_agent.agent.models import (
 from integration_agent.agent.state import PlannerState
 from integration_agent.api import APIEndpoint, APIInfo
 from integration_agent.repository import ProjectStructure, search_code
+from integration_agent.trace import emit
 
 # 未在目标项目中发现 HTTP 客户端时默认引入的库
 DEFAULT_HTTP_CLIENT = "httpx"
@@ -104,6 +106,15 @@ class DeterministicPlanner:
         self.default_http_client = default_http_client
 
     def plan(self, state: PlannerState) -> IntegrationPlan:
+        # 埋点带 planner 名：trace 不该绑定具体实现，而"这次计划是谁算出来的"
+        # 恰好是排查"为什么两次运行的方案不同"的第一个问题。
+        started = time.perf_counter()
+        emit(
+            "planner",
+            "planning_started",
+            "开始规划集成方案",
+            metadata={"planner": "deterministic"},
+        )
         api, project = state.api, state.project
         if not api.endpoints:
             raise PlanningError(f"API '{api.name}' 未定义任何端点（paths 为空），无法制定集成计划")
@@ -125,7 +136,7 @@ class DeterministicPlanner:
         inspected = _inspected_files(state)
         keywords = _keywords(state.request)
 
-        return IntegrationPlan(
+        plan = IntegrationPlan(
             integration_goal=_integration_goal(api, project, state.request),
             target_api=TargetAPI(
                 name=api.name,
@@ -167,6 +178,22 @@ class DeterministicPlanner:
                 api, selected, dependencies, authentication, documented_codes, project
             ),
         )
+        emit(
+            "planner",
+            "planning_completed",
+            "集成方案已生成",
+            metadata={
+                "planner": "deterministic",
+                "endpoints": len(plan.endpoints),
+                "files_to_create": len(plan.files_to_create),
+                "files_to_modify": len(plan.files_to_modify),
+                "dependencies": len(plan.dependencies),
+                "warnings": len(plan.warnings),
+            },
+            duration=time.perf_counter() - started,
+            status="completed",
+        )
+        return plan
 
     def _detect_http_client(self, state: PlannerState) -> tuple[str | None, str | None]:
         """检测仓库已在使用的 HTTP 客户端，返回 (库名, 使用该库的模块路径)。

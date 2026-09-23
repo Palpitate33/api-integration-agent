@@ -72,15 +72,21 @@ from integration_agent.tools import (
 # 工具 schema / 错误信息里都不该出现的东西
 CREDENTIAL_NEEDLES = ("api_key", "apikey", "authorization", "bearer", "password", "sk-")
 # 模块允许 import 的东西：只读回路不需要任何 IO 能力
+#
+# time / integration_agent.trace 是 Execution Trace 埋点带来的：前者只用于计时
+# （perf_counter），后者是纯内存的事件收集器，两者都不提供 IO 能力——下面的
+# FORBIDDEN_* 断言一个都没放宽。
 ALLOWED_LOOP_IMPORTS = {
     "hashlib",
     "json",
     "logging",
+    "time",
     "typing",
     "pydantic",
     "integration_agent.llm",
     "integration_agent.tools.models",
     "integration_agent.tools.registry",
+    "integration_agent.trace",
 }
 FORBIDDEN_SHELL_MODULES = ("subprocess", "os", "pty", "commands", "shutil")
 FORBIDDEN_NETWORK_MODULES = ("socket", "urllib", "http", "requests", "httpx", "aiohttp")

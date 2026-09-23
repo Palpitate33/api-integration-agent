@@ -31,6 +31,7 @@
 """
 
 import logging
+import time
 from typing import Protocol, runtime_checkable
 
 from integration_agent.generation import GeneratedArtifacts
@@ -48,6 +49,7 @@ from integration_agent.repair.repair_planner import (
     DeterministicRepairPlanner,
     RepairPlanner,
 )
+from integration_agent.trace import emit
 from integration_agent.validation import DeterministicTestRunner, TestResult, TestRunner
 
 # 组件异常的服务端日志出口：完整 traceback 只写这里，不进 API 响应。
@@ -145,6 +147,21 @@ class RepairLoopRunner:
                 )
 
             # 2. 规划修复（把当前轮次传给支持 iteration 状态的 planner）
+            # 埋点从"确定要修一次"开始：测试通过就不进这一支，也就没有修复这回事。
+            attempt = repair_count + 1
+            repair_started = time.perf_counter()
+            emit(
+                "repair",
+                "repair_started",
+                "开始一次修复",
+                metadata={
+                    "attempt": attempt,
+                    "max_iterations": self.max_iterations,
+                    "test_status": test_result.status,
+                    "failed": test_result.failed,
+                    "errors": test_result.errors,
+                },
+            )
             if hasattr(self.repair_planner, "iteration"):
                 self.repair_planner.iteration = repair_count
             try:
@@ -189,6 +206,25 @@ class RepairLoopRunner:
                 )
             applications.append(application)
             warnings.extend(application.warnings)
+            # 只记"改了几个文件、动了几条动作"，**不记 patch 内容**：
+            # 修复片段是完整代码，trace 里该有的是这次修复的形状。
+            emit(
+                "repair",
+                "repair_completed",
+                "一次修复已应用",
+                metadata={
+                    "attempt": attempt,
+                    "status": "applied" if application.changed else "no_progress",
+                    "changed": application.changed,
+                    "files_changed": len(
+                        {action.file for action in application.applied_actions if action.file}
+                    ),
+                    "applied_actions": len(application.applied_actions),
+                    "skipped_actions": len(application.skipped_actions),
+                },
+                duration=time.perf_counter() - repair_started,
+                status="applied" if application.changed else "no_progress",
+            )
             if not application.changed:
                 # 有修复建议但应用层无法产生代码变化：停止，避免无限重复同一计划
                 return RepairLoopResult(

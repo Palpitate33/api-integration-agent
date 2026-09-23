@@ -12,6 +12,9 @@
       工具的查找与执行只经过 ToolRegistry.get() 与 AgentTool.invoke()，没有 if/elif 分派。
     - 不认识 API Key：凭据只存在于注入的 ToolCallingClient 内部，本模块拿到的
       只有消息与一轮响应，没有任何读取环境变量或凭据的接口。
+    - 埋点只经过 trace.emit()：本模块不需要知道有没有人在收集 trace，签名与返回值
+      一字未变，没有打开 trace 作用域时 emit 是空操作。记录的只有工具名、轮次、
+      计数、状态——**没有 prompt、没有工具返回正文、没有 LLM 响应正文**。
 
 安全边界：
     - **绝不伪造 tool call**：assistant 消息一律由 AssistantTurn.to_message() 原样
@@ -34,6 +37,7 @@
 import hashlib
 import json
 import logging
+import time
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
@@ -46,6 +50,7 @@ from integration_agent.llm import (
 )
 from integration_agent.tools.models import ToolResult
 from integration_agent.tools.registry import AgentTool, ToolContext, ToolRegistry
+from integration_agent.trace import emit
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +179,15 @@ class AgentLoopRunner:
         if not isinstance(user_prompt, str) or not user_prompt.strip():
             return AgentRunResult(status="error", error=INVALID_PROMPT)
 
+        # 埋点从这里开始：prompt 校验没过就没有"回路开始"这回事，不该留下 stage_started。
+        started = time.perf_counter()
+        emit(
+            "agent",
+            "stage_started",
+            "Agent 回路开始",
+            metadata={"max_turns": config.max_turns, "max_tool_calls": config.max_tool_calls},
+        )
+
         messages: list[ChatMessage] = [
             ChatMessage(role="system", content=system_prompt),
             ChatMessage(role="user", content=user_prompt),
@@ -199,6 +213,21 @@ class AgentLoopRunner:
             error: str | None = None,
         ) -> AgentRunResult:
             """收口：把"已经发生过什么"原样带出，不让任何一次失败变成黑盒。"""
+            # 回路的**每一条**退出路径都经过这里，所以阶段结束事件只在这里发一次：
+            # 分散到 9 个 return 上迟早会漏掉一条，而漏掉的那条恰好就是排障时最需要的。
+            emit(
+                "agent",
+                "stage_completed" if status == "completed" else "stage_failed",
+                "Agent 回路结束",
+                metadata={
+                    "turns": turns,
+                    "tool_calls": len(calls),
+                    "observation_chars": observation_chars,
+                    "warnings": len(warnings),
+                },
+                duration=time.perf_counter() - started,
+                status=status,
+            )
             return AgentRunResult(
                 status=status,
                 final_message=final_message,
@@ -224,12 +253,32 @@ class AgentLoopRunner:
                     error="消息历史超出上限，已停止（不静默丢弃历史）",
                 )
 
+            # 只记规模，不记内容：这次请求里装着完整提示词，而提示词可能夹带仓库
+            # 代码片段与 OpenAPI 全文——它们是**输入数据**，不是可观测性该留的副本。
+            emit(
+                "agent",
+                "llm_called",
+                "调用 LLM",
+                metadata={"turn": turns + 1, "messages": len(messages), "tools": len(tools)},
+            )
+            llm_started = time.perf_counter()
             try:
                 turn = llm.chat(messages=messages, tools=tools)
             except Exception:  # noqa: BLE001 - 任何 LLM 侧故障都收敛成有界状态
                 logger.exception("Agent Loop 调用 LLM 失败")
                 return finish("llm_error", error=LLM_CALL_FAILED)
             turns += 1
+            emit(
+                "agent",
+                "llm_completed",
+                "LLM 返回一轮结果",
+                metadata={
+                    "turn": turns,
+                    "tool_calls": len(turn.tool_calls),
+                    "response_chars": len(turn.content),
+                },
+                duration=time.perf_counter() - llm_started,
+            )
 
             # ---- 情况一：模型没有再要求调用工具 → 这就是最终回答 ----
             if not turn.tool_calls:
@@ -268,6 +317,13 @@ class AgentLoopRunner:
                         error=f"工具调用次数达到上限 {config.max_tool_calls}，已停止",
                     )
                 calls.append(call)
+                # 工具名由模型给出（可以任意长），所以先 _short 再进 metadata。
+                emit(
+                    "agent",
+                    "tool_called",
+                    "执行工具",
+                    metadata={"tool": _short(name), "call": len(calls)},
+                )
 
                 # 1) 按名字查注册表：没有 if/elif 分派，也没有"猜一个相近的工具名"
                 tool = registry.get(name)
@@ -297,6 +353,20 @@ class AgentLoopRunner:
 
                 # ---- 统一收尾：记录结果 → 回填 tool 消息 → 更新预算 ----
                 results.append(result)
+                # 记录的是**结果摘要**（成功与否、产出多少字符），不是工具返回的正文：
+                # 正文可能是一整份文件内容，那是 observation 预算该管的事，不是 trace。
+                emit(
+                    "agent",
+                    "tool_completed",
+                    "工具执行结束",
+                    metadata={
+                        "tool": result.tool,
+                        "call": len(calls),
+                        "ok": result.ok,
+                        "chars": len(result.content),
+                    },
+                    status="ok" if result.ok else "error",
+                )
                 observation = _observation(result)
                 messages.append(ChatMessage(role="tool", tool_call_id=call_id, content=observation))
                 history_chars += len(observation) + len(call_id)

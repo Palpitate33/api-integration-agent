@@ -42,6 +42,7 @@ LLM 负责**判断**：集成目标、策略取舍、要新建/修改哪些文�
 """
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,7 @@ from integration_agent.agent.tool_prompt import build_tool_planner_prompts
 from integration_agent.llm import ToolCallingClient
 from integration_agent.tools import build_default_registry
 from integration_agent.tools.registry import ToolContext, ToolRegistry
+from integration_agent.trace import emit
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,13 @@ class ToolUsingPlanner:
 
         整个过程只读、可重放（同一输入 + 同一模型输出 = 同一计划）。
         """
+        started = time.perf_counter()
+        emit(
+            "planner",
+            "planning_started",
+            "开始规划集成方案",
+            metadata={"planner": "tool_using", "tools": len(self.registry.specs())},
+        )
         warnings: list[str] = []
 
         # 1. 初始上下文：只给事实与已有证据，要不要补由模型自己决定
@@ -164,7 +173,27 @@ class ToolUsingPlanner:
         plan, constraint_warnings = enforce_constraints(plan, state)
         warnings.extend(constraint_warnings)
 
-        return plan.model_copy(update={"warnings": [*plan.warnings, *warnings]})
+        plan = plan.model_copy(update={"warnings": [*plan.warnings, *warnings]})
+        # agent_status 把"这次规划背后那条回路跑得怎么样"带进 planner 事件：
+        # 计划看起来正常、回路其实一路降级，是这类 Planner 最需要被看见的情况。
+        emit(
+            "planner",
+            "planning_completed",
+            "集成方案已生成",
+            metadata={
+                "planner": "tool_using",
+                "agent_status": result.status,
+                "turns": result.turns,
+                "tool_calls": result.call_count,
+                "endpoints": len(plan.endpoints),
+                "files_to_create": len(plan.files_to_create),
+                "files_to_modify": len(plan.files_to_modify),
+                "warnings": len(plan.warnings),
+            },
+            duration=time.perf_counter() - started,
+            status="completed",
+        )
+        return plan
 
 
 def parse_final_plan(raw: str) -> dict[str, Any]:

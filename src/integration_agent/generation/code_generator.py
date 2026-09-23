@@ -33,6 +33,7 @@ target_api.name / endpoint.path / operationId / 参数名 / schema $ref / 依赖
 """
 
 import re
+import time
 from typing import Protocol, runtime_checkable
 
 from integration_agent.agent import (
@@ -55,6 +56,7 @@ from integration_agent.generation.rendering import (
     module_path,
     string_literal,
 )
+from integration_agent.trace import emit
 
 # OpenAPI schema 类型 → Python 类型提示
 SCHEMA_TYPE_HINTS = {
@@ -95,17 +97,48 @@ class DeterministicCodeGenerator:
     """规则驱动的确定性代码生成器：IntegrationPlan → GeneratedArtifacts。"""
 
     def generate(self, plan: IntegrationPlan) -> GeneratedArtifacts:
+        started = time.perf_counter()
+        emit(
+            "generation",
+            "stage_started",
+            "开始生成集成代码",
+            metadata={
+                "endpoints": len(plan.endpoints),
+                "files_to_create": len(plan.files_to_create),
+                "files_to_modify": len(plan.files_to_modify),
+            },
+        )
         files: list[GeneratedFile] = []
         files.extend(self._generated_created(plan))
         files.extend(self._generated_modified(plan))
         files.extend(self._generated_tests(plan))
         dependency_changes = self._dependency_changes(plan)
-        return GeneratedArtifacts(
+        artifacts = GeneratedArtifacts(
             files=files,
             dependency_changes=dependency_changes,
             summary=_summary(plan, files, dependency_changes),
             warnings=_warnings(plan, dependency_changes),
         )
+        created = sum(1 for item in files if item.action == "create")
+        generated_tests = _test_file_count(plan)
+        # 计数而不是内容：trace 里放的是一份生成物的**形状**（几个源文件、几个测试），
+        # 不是生成出来的源码——那是 artifacts 的职责，也是体积所在。
+        emit(
+            "generation",
+            "generation_completed",
+            "集成代码已生成",
+            metadata={
+                "file_count": len(files),
+                "generated_test_count": generated_tests,
+                "generated_source_count": created - generated_tests,
+                "modified_count": len(files) - created,
+                "dependency_changes": len(dependency_changes),
+                "warnings": len(artifacts.warnings),
+            },
+            duration=time.perf_counter() - started,
+            status="completed",
+        )
+        return artifacts
 
     # ---------------------------------------------------------- files_to_create
 
@@ -1364,6 +1397,19 @@ def _is_advisory_modification(item: FileModification) -> bool:
     return not manifest and not init
 
 
+def _test_file_count(plan: IntegrationPlan) -> int:
+    """本次生成的测试文件数（= testing_strategy 里的三类测试规格数）。
+
+    生成器写出多少测试文件由计划决定，_summary 与 trace 的计数都取自这里——
+    两处各数一次，迟早会在"新增一类测试"时给出互相矛盾的两个数字。
+    """
+    return (
+        len(plan.testing_strategy.unit_tests)
+        + len(plan.testing_strategy.integration_tests)
+        + len(plan.testing_strategy.contract_tests)
+    )
+
+
 def _summary(
     plan: IntegrationPlan,
     files: list[GeneratedFile],
@@ -1371,11 +1417,7 @@ def _summary(
 ) -> str:
     created = sum(1 for item in files if item.action == "create")
     modified = sum(1 for item in files if item.action == "modify")
-    test_count = (
-        len(plan.testing_strategy.unit_tests)
-        + len(plan.testing_strategy.integration_tests)
-        + len(plan.testing_strategy.contract_tests)
-    )
+    test_count = _test_file_count(plan)
     return (
         f"为 {plan.target_api.name} v{plan.target_api.version} 生成集成代码："
         f"新建 {created - test_count} 个源文件、{test_count} 个测试文件，"

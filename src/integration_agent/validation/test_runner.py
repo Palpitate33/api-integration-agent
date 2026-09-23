@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from integration_agent.generation import DependencyChange, GeneratedArtifacts
+from integration_agent.trace import emit
 from integration_agent.validation.models import FailureDetail, TestResult
 
 DEFAULT_TIMEOUT = 30.0
@@ -182,6 +183,13 @@ class DeterministicTestRunner:
         self.dependency_preparer = dependency_preparer or OfflineDependencyPreparer()
 
     def run(self, artifacts: GeneratedArtifacts) -> TestResult:
+        started = time.perf_counter()
+        emit(
+            "test_runner",
+            "test_started",
+            "开始运行生成产物的测试",
+            metadata={"files": len(artifacts.created_files), "timeout": self.timeout},
+        )
         try:
             with tempfile.TemporaryDirectory(
                 prefix="apiforge-tests-", dir=self.workspace_parent
@@ -193,14 +201,35 @@ class DeterministicTestRunner:
                 # 复制放在产物落地**之后**：工作区里这个文件名由 runner 独占，
                 # 生成产物无法抢占它（抢了也被覆盖）。
                 _install_runner_plugin(workspace)
-                return self._run_pytest(workspace, dependency_warnings)
+                result = self._run_pytest(workspace, dependency_warnings)
         except Exception as exc:  # 环境级失败（如路径越界）统一转为 error 结果
-            return TestResult(
+            result = TestResult(
                 status="error",
                 exit_code=None,
                 duration=0.0,
                 stderr=f"Test Runner 执行失败：{exc}",
             )
+        emit(
+            "test_runner",
+            "test_completed",
+            "测试运行结束",
+            # 记的是 TestResult 的**摘要**，不是重新解析 pytest 的结论：TestResult
+            # 仍然是测试结果的唯一结构化事实来源，这里只是它的镜像——两者不一致时，
+            # 错的一定是这里。事件级 duration 是整个 runner 的墙钟（含工作区准备），
+            # metadata 里的 duration 才是 pytest 自己测得的测试耗时。
+            metadata={
+                "status": result.status,
+                "passed": result.passed,
+                "failed": result.failed,
+                "errors": result.errors,
+                "skipped": result.skipped,
+                "duration": result.duration,
+                "exit_code": result.exit_code,
+            },
+            duration=time.perf_counter() - started,
+            status=result.status,
+        )
+        return result
 
     @staticmethod
     def _materialize(artifacts: GeneratedArtifacts, workspace: Path) -> None:

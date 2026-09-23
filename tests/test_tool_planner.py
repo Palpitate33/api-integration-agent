@@ -87,9 +87,14 @@ components:
 REQUEST = "把宠物接口集成进示例项目"
 
 # ToolUsingPlanner 允许 import 的东西：它不该有任何"重新解析/重新扫描"的入口
+#
+# time / integration_agent.trace 是 Execution Trace 埋点带来的：前者只用于计时
+# （perf_counter），后者是纯内存的事件收集器，两者都不提供"重新解析/重新扫描"的
+# 能力——上面的 FORBIDDEN_PLANNER_IMPORTS 一个都没放宽。
 ALLOWED_PLANNER_IMPORTS = {
     "logging",
     "pathlib",
+    "time",
     "typing",
     "integration_agent.agent.agent_loop",
     "integration_agent.agent.deepseek_planner",
@@ -101,6 +106,7 @@ ALLOWED_PLANNER_IMPORTS = {
     "integration_agent.llm",
     "integration_agent.tools",
     "integration_agent.tools.registry",
+    "integration_agent.trace",
 }
 FORBIDDEN_PLANNER_IMPORTS = {
     "integration_agent.api.parser",

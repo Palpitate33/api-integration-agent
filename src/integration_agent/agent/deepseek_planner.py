@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 from integration_agent.agent.models import (
@@ -51,6 +52,7 @@ from integration_agent.agent.state import PlannerState
 from integration_agent.api import APIEndpoint, APIInfo
 from integration_agent.llm import LLMClient
 from integration_agent.repository import search_code
+from integration_agent.trace import emit
 
 # ------------------------------------------------------------------ 常量
 
@@ -132,6 +134,13 @@ class DeepSeekPlanner:
 
     def plan(self, state: PlannerState) -> IntegrationPlan:
         """生成集成方案。整个过程只读、可重放（同一输入 + 同一 LLM 输出 = 同一计划）。"""
+        started = time.perf_counter()
+        emit(
+            "planner",
+            "planning_started",
+            "开始规划集成方案",
+            metadata={"planner": "llm"},
+        )
         warnings: list[str] = []
 
         # 1. 证据准备（调用方已提供则原样使用，不重复检索）
@@ -139,7 +148,17 @@ class DeepSeekPlanner:
 
         # 2. 渲染 prompt 并调用 LLM（唯一一次外部调用）
         prompt = build_planner_prompt(state, max_chars=self.max_prompt_chars)
+        # 只记 prompt 规模：它装着仓库代码片段与 OpenAPI 节选，不放进 trace。
+        emit("planner", "llm_called", "调用 LLM 生成计划", metadata={"prompt_chars": len(prompt)})
+        llm_started = time.perf_counter()
         raw = self._call_llm(prompt)
+        emit(
+            "planner",
+            "llm_completed",
+            "LLM 返回计划文本",
+            metadata={"response_chars": len(raw)},
+            duration=time.perf_counter() - llm_started,
+        )
 
         # 3. 解析 → 约束 → 校验
         data = parse_plan_json(raw)
@@ -158,7 +177,23 @@ class DeepSeekPlanner:
         warnings.extend(constraint_warnings)
 
         # LLM 自己声明的不确定性排在前面，程序发现的约束问题排在后面
-        return plan.model_copy(update={"warnings": [*plan.warnings, *warnings]})
+        plan = plan.model_copy(update={"warnings": [*plan.warnings, *warnings]})
+        emit(
+            "planner",
+            "planning_completed",
+            "集成方案已生成",
+            metadata={
+                "planner": "llm",
+                "endpoints": len(plan.endpoints),
+                "files_to_create": len(plan.files_to_create),
+                "files_to_modify": len(plan.files_to_modify),
+                "dependencies": len(plan.dependencies),
+                "warnings": len(plan.warnings),
+            },
+            duration=time.perf_counter() - started,
+            status="completed",
+        )
+        return plan
 
     # -------------------------------------------------------------- 内部
 
