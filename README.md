@@ -508,9 +508,9 @@ $env:DEEPSEEK_API_KEY = "sk-..."      # 请勿写入任何被 git 跟踪的文�
 
 | 检查 | 结果 |
 |---|---|
-| `uv run pytest -q` | **1179 passed, 6 skipped, 1 warning** |
+| `uv run pytest -q` | **1233 passed, 6 skipped, 1 warning** |
 | `uv run ruff check .` | All checks passed |
-| `uv run ruff format --check .` | 101 files already formatted |
+| `uv run ruff format --check .` | 104 files already formatted |
 
 6 个 skipped 均为 Windows 平台无符号链接权限导致的既有跳过（`tests/test_repository_symlink_boundary.py`）。
 
@@ -570,7 +570,7 @@ src/integration_agent/
 ├── api_server/         # FastAPI HTTP Adapter（app + paths + demo 注入器）
 └── __main__.py         # python -m integration_agent 入口
 
-tests/                  # 33 个测试文件 / 1179 个测试
+tests/                  # 36 个测试文件 / 1233 个测试
 
 examples/
 ├── openapi/petstore.yaml         # OpenAPI 3.x 示例 spec
