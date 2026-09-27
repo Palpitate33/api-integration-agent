@@ -449,6 +449,10 @@ def test_read_file_reads_relative_path(tmp_path: Path) -> None:
     assert result.error is None
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows path separator behavior is specific to Windows",
+)
 def test_read_file_accepts_nested_and_forward_slash_paths(tmp_path: Path) -> None:
     _project_tree(tmp_path)
     tool = ReadFileTool()
