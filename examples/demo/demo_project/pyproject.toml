@@ -1,0 +1,9 @@
+# 被集成目标项目的元数据示例（APIForge Demo 专用，不安装、不构建）。
+# 显式声明 httpx：Planner 识别为"项目已有 HTTP 客户端"，集成方案复用而非重复规划；
+# 声明 pydantic：生成模型的运行时依赖视作已满足，计划里无需新增依赖条目。
+[project]
+name = "demo-user-service"
+version = "0.1.0"
+description = "既有用户管理服务：APIForge 面试 Demo 的被集成目标。"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27", "pydantic>=2.0"]

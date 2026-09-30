@@ -1,0 +1,118 @@
+# APIForge 面试 Demo 的输入之一：User Management API 的 OpenAPI 3.0 文档。
+# 三个端点全部带 users 标签——Integration Planner 的领域关键词提取（title + tags）
+# 靠它生成 "user" / "management" / "users" 三个检索词，从而在 demo_project 里
+# 发现可复用的既有业务模块。
+openapi: 3.0.3
+info:
+  title: User Management API
+  version: 1.2.0
+  description: >-
+    用户管理 API：按 ID 查询用户、创建用户、读取用户公开资料。
+    全部端点需要 Bearer Token 认证。
+servers:
+  - url: https://api.users.example.com/v1
+security:
+  - bearerAuth: []
+paths:
+  /users/{id}:
+    get:
+      operationId: getUser
+      summary: 按 ID 查询用户
+      tags: [users]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 用户 ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 用户详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: 用户不存在
+  /users:
+    post:
+      operationId: createUser
+      summary: 创建用户
+      tags: [users]
+      requestBody:
+        required: true
+        description: 新用户的资料
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewUser"
+      responses:
+        "201":
+          description: 创建成功，返回完整用户实体
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          description: 参数校验失败
+        "422":
+          description: 语义校验失败（如邮箱已被占用）
+  /users/{id}/profile:
+    get:
+      operationId: getUserProfile
+      summary: 查询用户公开资料
+      tags: [users]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 用户 ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 用户公开资料
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Profile"
+        "404":
+          description: 用户不存在
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 在 Authorization 头中携带 Bearer Token
+  schemas:
+    User:
+      type: object
+      required: [id, name, email]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+    NewUser:
+      type: object
+      required: [name, email]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+    Profile:
+      type: object
+      required: [bio]
+      properties:
+        bio:
+          type: string
+        avatar_url:
+          type: string
+          nullable: true
