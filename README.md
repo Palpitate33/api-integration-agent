@@ -35,6 +35,78 @@ An AI software engineering agent that turns a third-party OpenAPI specification 
 
 ---
 
+## Demo
+
+One real, deterministic end-to-end run — an OpenAPI spec and an existing Python repository in, a tested integration patch out. Every screenshot below is captured from an actual run of [`examples/demo/run_demo.py`](examples/demo/run_demo.py), not from a mock-up.
+
+自己跑一遍（先 `uv sync`，不需要 API Key、不需要网络）：
+
+```bash
+uv run python examples/demo/run_demo.py
+```
+
+### 1. Input
+
+一份 OpenAPI 3.0 spec（User Management API：3 个端点 + Bearer/JWT）和一个模拟的既有 Python 项目（`UserService` + `User` / `Profile` 模型）。`demo_project` 当前只操作内存数据，本次集成要补上的正是「接入第三方 API」这一段。
+
+![Input: OpenAPI spec and existing repository](docs/demo/00-input.png)
+
+### 2. API Understanding
+
+`parse_openapi` 把 spec 解析成结构化 `APIInfo`：3 个端点、`http-bearer (JWT)` 认证。只留下推理所需的字段，不把整份文档塞进上下文。
+
+![API Understanding](docs/demo/01-api-understanding.png)
+
+### 3. Repository Understanding
+
+`scan_repository` 扫描目标仓库：包名、2 个 Python 文件、2 个依赖，并提供带行号的关键词检索（`search_code`）供后续阶段使用。
+
+![Repository Understanding](docs/demo/02-repository-understanding.png)
+
+### 4. Integration Planning
+
+`DeterministicPlanner` 从 API 名称与 tags 提取领域关键词，经 `search_code` 检索到既有业务模块 `models.py` / `service.py`，因此选择 `extend_existing_client` 策略：复用项目已有的 `httpx`，不重复引入依赖；认证凭据只从环境变量读取。
+
+![Integration Planning](docs/demo/03-integration-planner.png)
+
+### 5. Code Generation
+
+产出 10 个文件：5 个源码（client / models / exceptions / config / `__init__`）、3 个测试（单元 / 集成 / 契约），以及 2 个针对既有模块的建议性修改片段。
+
+![Code Generation](docs/demo/04-code-generation.png)
+
+### 6. Test Runner
+
+在**隔离的临时工作区**里真实执行 pytest：`10 passed / 0 failed / 0 errors`，一次通过，repair 0 次。生成文件的落盘与测试执行都发生在临时工作区，`demo_project/` 运行前后逐字节不变。
+
+![Test Runner](docs/demo/05-test-runner.png)
+
+### 7. 最终结果
+
+最终状态 `SUCCESS`，四份结构化结果写入 `examples/demo/output/`（`integration_plan.json` / `generated_artifacts.json` / `test_result.json` / `trace.json`）。其中 `integration_plan.json` 与 `generated_artifacts.json` 跨运行逐字节一致。
+
+![Final result](docs/demo/06-final-result.png)
+
+```
+OpenAPI
+   ↓
+API Understanding
+   ↓
+Repository Understanding
+   ↓
+Integration Planner
+   ↓
+Code Generator
+   ↓
+Test Runner
+   ↓
+TestResult
+```
+
+Demo 的完整说明（输入、运行方式、生成内容、确定性）见 [examples/demo/README.md](examples/demo/README.md)。
+
+---
+
 ## 核心能力
 
 | 能力 | 模块 | 实现方式 |
